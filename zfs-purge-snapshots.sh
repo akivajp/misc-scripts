@@ -26,7 +26,7 @@ do
     shift
 done
 
-if [ ${#args} -lt 1 ]; then
+if [ ${#args[@]} -lt 1 ]; then
     echo "Usage: ${0##*/} [-d|--depth depth] zfs [zfs ...]" 1>&2
     exit 1
 fi
@@ -48,4 +48,3 @@ for fs in "${args[@]}"; do
         done
     fi
 done
-
