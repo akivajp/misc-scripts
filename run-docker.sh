@@ -4,6 +4,7 @@ set -eu
 
 args=()
 volumes=()
+ports=()
 gpus=""
 while (( $# > 0 ))
 do
@@ -19,6 +20,14 @@ do
             volumes+=(-v $2)
             shift
             ;;
+        -p)
+            if [[ -z "$2" ]]; then
+                echo "-p requires an argument" > /dev/stderr
+                exit 1
+            fi
+            ports+=(-p $2)
+            shift
+            ;;
         *)
             args+=($1)
             ;;
@@ -27,7 +36,7 @@ do
 done
 
 if [ ${#args[@]} -lt 1 ]; then
-    echo "usage: [--gpus] [-v host_dir:container_dir [-v ...] ...] container_name [docker_image]" > /dev/stderr
+    echo "usage: [--gpus] [-v host_dir:container_dir [-v ...] ...] [-p host_port:container_port [-p ...]] container_name [docker_image]" > /dev/stderr
     exit 1
 fi
 
@@ -65,9 +74,10 @@ if [ "$(docker ps -q -a -f name=/${container_name}$)" ]; then
 else
     # コンテナの作成と起動
     if [ ${#args[@]} -lt 2 ]; then
-        echo "usage: [--gpus] [-v host_dir:container_dir [-v ...] ...] container_name docker_image" > /dev/stderr
+        echo "usage: [--gpus] [-v host_dir:container_dir [-v ...] ...] [-p host_port:container_port [-p ...]] container_name docker_image" > /dev/stderr
         exit 1
     fi
-    echo "[exec] docker run ${gpus} --name ${container_name} --hostname ${container_name} ${volumes[@]} -it ${docker_image}"
-    docker run ${gpus} --name ${container_name} --hostname ${container_name} ${volumes[@]} -it ${docker_image}
+    echo "[exec] docker run ${gpus} --name ${container_name} --hostname ${container_name} ${volumes[@]} ${ports[@]} -it ${docker_image}"
+    docker run ${gpus} --name ${container_name} --hostname ${container_name} ${volumes[@]} ${ports[@]} -it ${docker_image}
 fi
+
