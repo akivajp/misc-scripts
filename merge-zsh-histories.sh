@@ -15,7 +15,7 @@ fi
 show-info "Merging history files: ${@}" > /dev/stderr
 
 for history in "${@}"; do
-    if [ ! -f "$history" ]; then
+    if [ ! -r "$history" ]; then
         show-error "File not found: $history" > /dev/stderr
         exit 1
     fi
