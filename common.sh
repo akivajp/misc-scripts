@@ -23,3 +23,12 @@ show-error() {
     timestamp=$(date "+%Y/%m/%d %H:%M:%S")
     echo -e "${red}[error at ${timestamp}] $@${clear}"
 }
+
+# コマンドがインストールされているかチェック
+check-command() {
+    if ! type $1 &> /dev/null; then
+        show-error "$1 is not installed. Exiting..."
+        exit 1
+    fi
+}
+
