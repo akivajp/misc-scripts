@@ -14,3 +14,10 @@ sudo systemctl stop tailscaled
 #sudo rm -rf /var/lib/tailscale/tailscaled.state
 sudo systemctl start tailscaled
 sudo tailscale up --accept-dns=true
+
+# 仮想マシンのアダプタを再有効化
+sudo virsh net-start default
+
+# 仮想マシンも停止していたら起動
+sudo virsh start windows11
+
