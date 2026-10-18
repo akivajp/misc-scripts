@@ -1,0 +1,590 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["rich>=13"]
+# ///
+"""rclone bisync で、クラウドストレージとローカルのフォルダを一定間隔で双方向に同期する。
+
+- 設定: ~/.config/cloud-sync/config.toml（`cloud-sync --help` と README 相当のコメントを参照）
+- 同期の間隔・実行は systemd --user の timer（`cloud-sync install` で生成する）
+- 状態: ~/.local/state/cloud-sync/<名前>.json（tag-keeper などから読める）
+- ログ: ~/logs/cloud-sync/<名前>.log（`tail -f` で経過を追える）
+- 上書き・削除されたファイルは、実行ごとの退避先（<history_dir>/<名前>/<実行日時>/<元の相対パス>）に残す。
+  実行日時は秒まで含むので、1日に何度更新しても名前が衝突しない。
+
+設定の例::
+
+    [defaults]
+    history_dir = "~/CloudSync-history"   # 上書き・削除された版の退避先（同期フォルダの外に置くこと）
+    history_keep_days = 90                # 退避した版を残す日数
+    max_delete = 10                       # 1回の同期で許す削除の割合（%）。超えると止まる
+    rclone = "~/.local/bin/rclone"
+
+    [remotes.onedrive]
+    remote = "onedrive:"
+    local = "~/CloudSync/OneDrive"
+    interval = "30min"                    # systemd の時間表記
+    filters = ["- /Desktop/**"]           # rclone のフィルタ（先頭の / は同期ルート直下）
+    remote_history = "onedrive:.cloud-sync-history"   # クラウド側で上書き・削除された版の退避先（空なら退避しない）
+    fast_list = false
+    mode = "bisync"                       # "bisync": 双方向 / "sync": ローカルからクラウドへの一方向バックアップ
+    extra_args = []                       # rclone に足す引数（例: ["--onedrive-delta"]）
+    exclusive_with = []                   # 同時に動かしたくない他の項目（同じフォルダを含む場合など）
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import tomllib
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from rich.console import Console
+from rich.table import Table
+
+console = Console()
+
+# 実行日時のフォルダ名（辞書順 = 時系列。秒まで含めて衝突を避ける）
+STAMP_FORMAT = "%Y-%m-%dT%H%M%S"
+# 退避先のうち、同期の対象に入ってしまわないよう常に除外するパス（OneDrive のようにルートがドライブ全体のとき用）
+REMOTE_HISTORY_EXCLUDE = "- /.cloud-sync-history/**"
+EXIT_BUSY = 75  # EX_TEMPFAIL: 別の同期が動いている
+
+
+def config_path() -> Path:
+    """設定ファイルのパス（XDG_CONFIG_HOME に従う）。"""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(base) / "cloud-sync" / "config.toml"
+
+
+def state_dir() -> Path:
+    """状態・ロック・bisync の作業フォルダの置き場所（XDG_STATE_HOME に従う）。"""
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "cloud-sync"
+
+
+def expand(p: str) -> Path:
+    """~ を展開したパスにする。"""
+    return Path(os.path.expanduser(p))
+
+
+@dataclass
+class Entry:
+    """同期の1項目（クラウド側のルート1つとローカルのフォルダ1つの組）。"""
+
+    name: str
+    remote: str
+    local: Path
+    interval: str = "30min"
+    offset: str = "5min"  # 起動後、最初の実行までの時間
+    filters: list[str] = field(default_factory=list)
+    remote_history: str = ""
+    fast_list: bool = False
+    mode: str = "bisync"  # "bisync"（双方向）か "sync"（ローカル → クラウドの一方向バックアップ）
+    extra_args: list[str] = field(default_factory=list)
+    exclusive_with: list[str] = field(default_factory=list)
+    max_delete: int | None = None
+    flush_max_delete: int = 50  # tag-keeper が意図して大量に消したときの上限（%）
+
+
+@dataclass
+class Config:
+    """設定ファイル全体。"""
+
+    rclone: Path
+    history_dir: Path
+    history_keep_days: int
+    max_delete: int
+    log_dir: Path
+    entries: dict[str, Entry]
+
+
+def load_config(path: Path | None = None) -> Config:
+    """設定ファイルを読む。無い・不正ならメッセージを出して終了する。"""
+    p = path or config_path()
+    try:
+        raw = tomllib.loads(p.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        sys.exit(f"設定ファイルを読めません: {p}: {e}")
+    d = raw.get("defaults", {})
+    entries: dict[str, Entry] = {}
+    for name, r in raw.get("remotes", {}).items():
+        entries[name] = Entry(
+            name=name,
+            remote=r["remote"],
+            local=expand(r["local"]),
+            interval=r.get("interval", "30min"),
+            offset=r.get("offset", "5min"),
+            filters=list(r.get("filters", [])),
+            remote_history=r.get("remote_history", ""),
+            fast_list=bool(r.get("fast_list", False)),
+            mode=r.get("mode", "bisync"),
+            extra_args=list(r.get("extra_args", [])),
+            exclusive_with=list(r.get("exclusive_with", [])),
+            max_delete=r.get("max_delete"),
+            flush_max_delete=int(r.get("flush_max_delete", 50)),
+        )
+    return Config(
+        rclone=expand(d.get("rclone", "~/.local/bin/rclone")),
+        history_dir=expand(d.get("history_dir", "~/CloudSync-history")),
+        history_keep_days=int(d.get("history_keep_days", 90)),
+        max_delete=int(d.get("max_delete", 10)),
+        log_dir=expand(d.get("log_dir", "~/logs/cloud-sync")),
+        entries=entries,
+    )
+
+
+def now_iso() -> str:
+    """現在時刻（ローカル、秒まで）の ISO 表記。"""
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+# --------------------------------------------------------------------------- 状態とロック
+
+
+def read_state(name: str) -> dict[str, Any]:
+    """状態ファイルを読む。無ければ空の辞書。"""
+    try:
+        return json.loads((state_dir() / f"{name}.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_state(name: str, **fields: Any) -> dict[str, Any]:
+    """状態ファイルを更新する（一時ファイル経由で置き換え、読み手に途中の内容を見せない）。"""
+    state = read_state(name)
+    state.update(fields)
+    state["name"] = name
+    state["updated"] = now_iso()
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / f".{name}.json.tmp"
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(d / f"{name}.json")
+    return state
+
+
+class Busy(RuntimeError):
+    """同じ項目の同期がすでに動いているときの例外。"""
+
+
+@contextlib.contextmanager
+def locked(name: str, *, blocking: bool) -> Iterator[None]:
+    """項目ごとのロックを取る（プロセスが落ちれば OS が自動で解放する）。"""
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / f"{name}.lock", "w") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError as e:
+            raise Busy(name) from e
+        yield
+
+
+# --------------------------------------------------------------------------- 同期の実行
+
+
+def build_filters(entry: Entry) -> Path:
+    """フィルタファイルを書き出してパスを返す（退避先の除外を必ず足す）。"""
+    d = state_dir() / entry.name
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / "filters.txt"
+    lines = [*entry.filters]
+    if REMOTE_HISTORY_EXCLUDE not in lines:
+        lines.append(REMOTE_HISTORY_EXCLUDE)
+    f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return f
+
+
+def bisync_command(
+    cfg: Config,
+    entry: Entry,
+    stamp: str,
+    *,
+    dry_run: bool,
+    resync: bool,
+    max_delete: int,
+    log_file: Path,
+) -> list[str]:
+    """rclone bisync のコマンドを組み立てる。"""
+    if entry.mode == "sync":
+        return sync_command(cfg, entry, stamp, dry_run=dry_run, log_file=log_file)
+    cmd = [
+        str(cfg.rclone), "bisync", entry.remote, str(entry.local),
+        "--filters-file", str(build_filters(entry)),
+        "--workdir", str(state_dir() / entry.name / "bisync"),
+        # 両側で変わったときは新しい方を採用し、古い方は別名で残す
+        "--conflict-resolve", "newer", "--conflict-loser", "pathname",
+        "--compare", "size,modtime",
+        "--max-delete", str(max_delete),
+        "--resilient", "--recover", "--max-lock", "2h",
+        "--create-empty-src-dirs",
+        "--backup-dir2", str(cfg.history_dir / entry.name / stamp),
+        "--log-file", str(log_file), "-v", "--stats", "30s",
+    ]
+    if entry.remote_history:
+        cmd += ["--backup-dir1", f"{entry.remote_history.rstrip('/')}/{entry.name}/{stamp}"]
+    if entry.fast_list:
+        cmd.append("--fast-list")
+    cmd += entry.extra_args
+    if resync:
+        cmd += ["--resync", "--resync-mode", "newer"]
+    if dry_run:
+        cmd.append("--dry-run")
+    return cmd
+
+
+def sync_command(cfg: Config, entry: Entry, stamp: str, *, dry_run: bool, log_file: Path) -> list[str]:
+    """一方向バックアップ（ローカル → クラウド）の rclone sync コマンドを組み立てる。
+
+    クラウド側で上書き・削除される版は、実行日時ごとの退避先（remote_history）へ移す。
+    退避先が無いと、クラウドで消す版がそのまま失われるので必須とする。
+    """
+    if not entry.remote_history:
+        sys.exit(f"{entry.name}: mode = \"sync\" には remote_history（退避先）が必要です")
+    cmd = [
+        str(cfg.rclone), "sync", str(entry.local), entry.remote,
+        "--filter-from", str(build_filters(entry)),
+        "--backup-dir", f"{entry.remote_history.rstrip('/')}/{entry.name}/{stamp}",
+        "--create-empty-src-dirs", "--retries-sleep", "1m",
+        "--log-file", str(log_file), "-v", "--stats", "30s",
+    ]
+    if entry.fast_list:
+        cmd.append("--fast-list")
+    cmd += entry.extra_args
+    if dry_run:
+        cmd.append("--dry-run")
+    return cmd
+
+
+def log_tail(path: Path, n: int = 5) -> str:
+    """ログの ERROR / CRITICAL の最後の数行（状態の表示用）。"""
+    try:
+        lines = [x for x in path.read_text(encoding="utf-8", errors="replace").splitlines() if "ERROR" in x or "CRITICAL" in x]
+    except OSError:
+        return ""
+    return " / ".join(x.split(" : ", 1)[-1][:200] for x in lines[-n:])
+
+
+def count_files(root: Path) -> int:
+    """フォルダ配下のファイル数（退避した版の数を数えるため）。無ければ 0。"""
+    return sum(len(files) for _d, _s, files in os.walk(root)) if root.is_dir() else 0
+
+
+def run_entry(cfg: Config, name: str, *, dry_run: bool, resync: bool, max_delete: int | None) -> int:
+    """1項目の同期を実行して終了コードを返す。"""
+    entry = cfg.entries[name]
+    if resync and entry.mode == "sync":
+        sys.exit(f"{name}: 一方向バックアップ（mode = \"sync\"）に --resync は要りません")
+    others = [n for n in entry.exclusive_with if n in cfg.entries]
+    try:
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(locked(name, blocking=False))
+            # 同じフォルダを含む項目とは、順番に動かす（相手が終わるまで待つ）
+            if others:
+                write_state(name, state="waiting", pid=os.getpid())
+            for o in others:
+                stack.enter_context(locked(o, blocking=True))
+            return _run_locked(cfg, entry, dry_run=dry_run, resync=resync, max_delete=max_delete)
+    except Busy:
+        console.print(f"[yellow]{name}: すでに同期が動いています[/]")
+        return EXIT_BUSY
+
+
+def _run_locked(cfg: Config, entry: Entry, *, dry_run: bool, resync: bool, max_delete: int | None) -> int:
+    """ロックを取った状態で bisync を実行し、状態・退避先・古い版の整理を行う。"""
+    name = entry.name
+    stamp = dt.datetime.now().strftime(STAMP_FORMAT)
+    cfg.log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = cfg.log_dir / f"{name}.log"
+    entry.local.mkdir(parents=True, exist_ok=True)
+    mdel = max_delete if max_delete is not None else (entry.max_delete if entry.max_delete is not None else cfg.max_delete)
+    cmd = bisync_command(cfg, entry, stamp, dry_run=dry_run, resync=resync, max_delete=mdel, log_file=log_file)
+    started = time.time()
+    # dry-run は状態に「実行中」を出さない（画面に出る同期と区別する）
+    if not dry_run:
+        write_state(name, state="running", pid=os.getpid(), started=now_iso(), stamp=stamp, mode="resync" if resync else "bisync", log=str(log_file))
+    with open(log_file, "a", encoding="utf-8") as lf:
+        lf.write(f"\n===== {now_iso()} cloud-sync {name} {'(dry-run) ' if dry_run else ''}{'(resync) ' if resync else ''}=====\n")
+    console.print(f"[cyan]{name}:[/] 同期を開始します（ログ: {log_file}）")
+    res = subprocess.run(cmd, check=False)  # 経過は log_file に出る
+    duration = round(time.time() - started, 1)
+    tail = log_tail(log_file) if res.returncode else ""
+    text = ""
+    with contextlib.suppress(OSError):
+        text = log_file.read_text(encoding="utf-8", errors="replace")[-20000:]
+    needs_resync = res.returncode != 0 and ("Must run --resync" in text or "--resync to recover" in text)
+    # この実行で退避された版の数。空なら退避先のフォルダを残さない
+    hist = cfg.history_dir / entry.name / stamp
+    saved = count_files(hist)
+    if hist.is_dir() and saved == 0:
+        shutil.rmtree(hist, ignore_errors=True)
+    if dry_run:
+        return res.returncode
+    state = "idle" if res.returncode == 0 else ("needs_resync" if needs_resync else "error")
+    fields: dict[str, Any] = {
+        "state": state, "pid": None, "finished": now_iso(), "duration": duration,
+        "exit_code": res.returncode, "saved_versions": saved, "message": tail,
+    }
+    if res.returncode == 0:
+        fields["last_ok"] = now_iso()
+    write_state(name, **fields)
+    if res.returncode == 0:
+        prune(cfg, entry, quiet=True)
+    else:
+        console.print(f"[red]{name}: 失敗しました（終了コード {res.returncode}）[/] {tail}")
+    return res.returncode
+
+
+# --------------------------------------------------------------------------- 退避した版の履歴・復元・整理
+
+
+def list_versions(cfg: Config, entry: Entry, rel: str) -> list[tuple[str, Path]]:
+    """ローカルの退避先にある、rel の過去の版を新しい順に返す: [(実行日時, パス)]。"""
+    base = cfg.history_dir / entry.name
+    out = [(d.name, d / rel) for d in sorted(base.iterdir(), reverse=True) if (d / rel).is_file()] if base.is_dir() else []
+    return out
+
+
+def to_rel(entry: Entry, path: str) -> str:
+    """同期ルートからの相対パスにする（絶対パスならローカルのフォルダからの相対）。"""
+    p = Path(os.path.expanduser(path))
+    if p.is_absolute():
+        try:
+            return p.resolve().relative_to(entry.local.resolve()).as_posix()
+        except ValueError:
+            sys.exit(f"同期フォルダの外のパスです: {path}")
+    return p.as_posix().lstrip("/")
+
+
+def cmd_history(cfg: Config, args: argparse.Namespace) -> int:
+    """ファイルの過去の版（退避先に残っているもの）を一覧する。"""
+    entry = cfg.entries[args.name]
+    rel = to_rel(entry, args.path)
+    table = Table(title=f"{args.name}: {rel}")
+    table.add_column("実行日時")
+    table.add_column("場所")
+    table.add_column("サイズ", justify="right")
+    table.add_column("元の更新日時")
+    rows = 0
+    for stamp, p in list_versions(cfg, entry, rel):
+        st = p.stat()
+        table.add_row(stamp, "ローカル", f"{st.st_size:,}", dt.datetime.fromtimestamp(st.st_mtime).strftime("%F %T"))
+        rows += 1
+    if args.remote and entry.remote_history:
+        base = f"{entry.remote_history.rstrip('/')}/{entry.name}"
+        res = subprocess.run([str(cfg.rclone), "lsf", "-R", "--files-only", "--include", rel, "--format", "pst", "--separator", "|", base],
+                             capture_output=True, text=True, check=False)
+        for line in sorted(res.stdout.splitlines(), reverse=True):
+            parts = line.split("|")
+            if len(parts) == 3 and parts[0].endswith(rel):
+                table.add_row(parts[0].split("/", 1)[0], "クラウド", f"{int(parts[1]):,}", parts[2])
+                rows += 1
+    if rows == 0:
+        console.print("退避された版はありません")
+        return 1
+    console.print(table)
+    return 0
+
+
+def cmd_restore(cfg: Config, args: argparse.Namespace) -> int:
+    """退避先のローカルにある版を、元の場所（または --to）へ戻す。上書きは --force が要る。"""
+    entry = cfg.entries[args.name]
+    rel = to_rel(entry, args.path)
+    versions = dict(list_versions(cfg, entry, rel))
+    if args.version not in versions:
+        console.print(f"[red]その版はありません。`cloud-sync history {args.name} {rel}` で確認してください[/]")
+        return 1
+    dest = Path(args.to) if args.to else entry.local / rel
+    if dest.exists() and not args.force:
+        console.print(f"[red]すでにあります: {dest}（上書きするなら --force、別の場所なら --to）[/]")
+        return 1
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(versions[args.version], dest)
+    console.print(f"戻しました: {dest}")
+    return 0
+
+
+def prune(cfg: Config, entry: Entry, *, quiet: bool = False) -> int:
+    """保持日数を過ぎた退避先（ローカルとクラウド）を削除する。消した実行の数を返す。"""
+    cutoff = (dt.datetime.now() - dt.timedelta(days=cfg.history_keep_days)).strftime(STAMP_FORMAT)
+    removed = 0
+    base = cfg.history_dir / entry.name
+    if base.is_dir():
+        for d in sorted(base.iterdir()):
+            if d.is_dir() and d.name < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+    if entry.remote_history:
+        rbase = f"{entry.remote_history.rstrip('/')}/{entry.name}"
+        res = subprocess.run([str(cfg.rclone), "lsf", "--dirs-only", rbase], capture_output=True, text=True, check=False)
+        for line in res.stdout.splitlines():
+            if line.rstrip("/") < cutoff:
+                subprocess.run([str(cfg.rclone), "purge", f"{rbase}/{line.rstrip('/')}"], capture_output=True, check=False)
+                removed += 1
+    if not quiet:
+        console.print(f"{entry.name}: {removed} 件の古い退避先を削除しました（{cfg.history_keep_days} 日より前）")
+    return removed
+
+
+# --------------------------------------------------------------------------- 状態表示と systemd 連携
+
+
+def pid_alive(pid: Any) -> bool:
+    """pid のプロセスが生きているか。"""
+    if not isinstance(pid, int):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def effective_state(name: str) -> dict[str, Any]:
+    """状態ファイルを読み、実行中のはずなのにプロセスが無ければ「中断」に直して返す。"""
+    s = read_state(name)
+    if s.get("state") in ("running", "waiting") and not pid_alive(s.get("pid")):
+        s["state"] = "interrupted"
+    return s
+
+
+def cmd_status(cfg: Config, args: argparse.Namespace) -> int:
+    """全項目の状態を表示する（--json で機械可読）。"""
+    states = {n: effective_state(n) for n in cfg.entries}
+    if args.json:
+        print(json.dumps(states, ensure_ascii=False, indent=1))
+        return 0
+    table = Table(title="cloud-sync")
+    for col in ("名前", "状態", "最後の成功", "所要(秒)", "退避した版", "メッセージ"):
+        table.add_column(col)
+    color = {"idle": "green", "running": "cyan", "waiting": "cyan"}
+    for n, s in states.items():
+        st = s.get("state", "-")
+        table.add_row(n, f"[{color.get(st, 'red')}]{st}[/]", str(s.get("last_ok", "-")), str(s.get("duration", "-")),
+                      str(s.get("saved_versions", "-")), str(s.get("message", ""))[:80])
+    console.print(table)
+    return 0
+
+
+def unit_files(cfg: Config, entry: Entry) -> dict[str, str]:
+    """項目の systemd --user ユニット（service と timer）の内容。"""
+    exe = Path(__file__).resolve()
+    service = f"""# cloud-sync {entry.name} の1回分の同期（cloud-sync install が生成。直接編集せず config.toml を編集して再生成すること）
+[Unit]
+Description=cloud-sync {entry.name} ({entry.remote} <-> {entry.local})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart={exe} run {entry.name}
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=6h
+# 別の同期が動いているとき（終了コード {EXIT_BUSY}）は失敗扱いにしない
+SuccessExitStatus={EXIT_BUSY}
+"""
+    timer = f"""# cloud-sync {entry.name} の定期実行（前回の終了から interval 後に次を開始する）
+[Unit]
+Description=cloud-sync {entry.name} timer
+
+[Timer]
+OnBootSec={entry.offset}
+OnUnitInactiveSec={entry.interval}
+Unit=cloud-sync-{entry.name}.service
+
+[Install]
+WantedBy=timers.target
+"""
+    return {f"cloud-sync-{entry.name}.service": service, f"cloud-sync-{entry.name}.timer": timer}
+
+
+def cmd_install(cfg: Config, args: argparse.Namespace) -> int:
+    """ユニットを生成して daemon-reload する（--enable で timer を有効化して開始する）。"""
+    d = Path(os.path.expanduser("~/.config/systemd/user"))
+    d.mkdir(parents=True, exist_ok=True)
+    for entry in cfg.entries.values():
+        for fname, body in unit_files(cfg, entry).items():
+            (d / fname).write_text(body, encoding="utf-8")
+            console.print(f"書きました: {d / fname}")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    if args.enable:
+        for entry in cfg.entries.values():
+            subprocess.run(["systemctl", "--user", "enable", "--now", f"cloud-sync-{entry.name}.timer"], check=False)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """コマンドラインの入口。"""
+    ap = argparse.ArgumentParser(prog="cloud-sync", description="rclone bisync でクラウドとローカルを一定間隔で双方向に同期する")
+    ap.add_argument("--config", type=Path, help="設定ファイル（既定: ~/.config/cloud-sync/config.toml）")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("run", help="1項目を今すぐ同期する")
+    p.add_argument("name")
+    p.add_argument("--dry-run", action="store_true", help="何も変更せず、差分だけ確認する")
+    p.add_argument("--resync", action="store_true", help="基準を作り直す（初回や、needs_resync のとき）")
+    p.add_argument("--max-delete", type=int, help="この実行で許す削除の割合（%%）")
+
+    p = sub.add_parser("status", help="全項目の状態")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("install", help="systemd --user のユニットを生成する")
+    p.add_argument("--enable", action="store_true", help="timer を有効化して開始する")
+
+    p = sub.add_parser("history", help="ファイルの過去の版（退避先）を一覧する")
+    p.add_argument("name")
+    p.add_argument("path", help="同期ルートからの相対パス、またはローカルの絶対パス")
+    p.add_argument("--remote", action="store_true", help="クラウド側の退避先も探す（遅いことがある）")
+
+    p = sub.add_parser("restore", help="退避先の版を戻す")
+    p.add_argument("name")
+    p.add_argument("path")
+    p.add_argument("version", help="history で表示された実行日時")
+    p.add_argument("--to", help="戻し先（既定は元の場所）")
+    p.add_argument("--force", action="store_true", help="あるファイルを上書きする")
+
+    p = sub.add_parser("prune", help="保持日数を過ぎた退避先を削除する")
+    p.add_argument("name", nargs="?")
+
+    args = ap.parse_args(argv)
+    cfg = load_config(args.config)
+    name = getattr(args, "name", None)
+    if name and name not in cfg.entries:
+        sys.exit(f"設定に無い項目です: {name}（あるもの: {', '.join(cfg.entries)}）")
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    if args.cmd == "run":
+        return run_entry(cfg, args.name, dry_run=args.dry_run, resync=args.resync, max_delete=args.max_delete)
+    if args.cmd == "status":
+        return cmd_status(cfg, args)
+    if args.cmd == "install":
+        return cmd_install(cfg, args)
+    if args.cmd == "history":
+        return cmd_history(cfg, args)
+    if args.cmd == "restore":
+        return cmd_restore(cfg, args)
+    if args.cmd == "prune":
+        for e in ([cfg.entries[name]] if name else cfg.entries.values()):
+            prune(cfg, e)
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
