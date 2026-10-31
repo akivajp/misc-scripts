@@ -46,16 +46,23 @@ btrfs-nocow rollback             # 元に戻す（移行の後に書き込まれ
 | `mysql` | `/var/lib/mysql`（全体を NOCOW） | mysql.service・mariadb.service |
 | `postgresql` | `/var/lib/postgresql`（全体を NOCOW） | postgresql.service |
 | `mongodb` | `/var/lib/mongodb`（全体を NOCOW） | mongod.service |
+| `atuin` | atuin（シェル履歴）のデータ（全体を NOCOW、サブボリュームにはしない） | atuin のデーモン（プロセス） |
 
-どれもサブボリュームとして作り直す。止めるのは動いているサービスだけで、終わったら逆順に起動し直す。
-`docker` では、移行前に動いていたコンテナのうち、再起動ポリシーで上がらなかったものも起動し直す。
+- `atuin` 以外は、どれもサブボリュームとして作り直す。
+- 止めるのは動いているサービスだけで、終わったら逆順に起動し直す。
+- `docker` では、移行前に動いていたコンテナのうち、再起動ポリシーで上がらなかったものも起動し直す。
+- `atuin` は一般ユーザーのまま動く（sudo で起動し直さない）。
+  - 置き場所は `atuin info` の `client db path` から調べる。版や `ATUIN_HOME` で、`~/.atuin/data` や `~/.local/share/atuin` に変わるため。
+  - デーモンは、コマンドライン・環境変数・作業ディレクトリを控えてから止め、終わったら同じ形で起動し直す。
+  - 履歴をスナップショットで守るため、サブボリュームにはしない。スナップショットの後の書き込みは一度 CoW されるが、コピーし直すことで、それまでの断片化は解消する。
+  - 戻す・消すときは `btrfs-nocow rollback --no-sudo` / `btrfs-nocow cleanup --no-sudo`。一般ユーザーの記録は `~/.local/state/btrfs-nocow/` にあるため。
 
 ### 任意のディレクトリ
 
 ```sh
 btrfs-nocow migrate /srv/vm --subvolume --nocow                          # サブボリュームにして全体を NOCOW
 btrfs-nocow migrate /opt/app/data --subvolume --nocow-subdir db --stop app.service   # db/ だけ NOCOW
-btrfs-nocow migrate ~/.atuin/data --nocow --no-sudo                      # スナップショットの中のまま NOCOW だけ
+btrfs-nocow migrate ~/data --nocow --no-sudo                             # 自分のディレクトリ（書き込むプロセスは先に止める）
 ```
 
 ## migrate がすること
@@ -69,13 +76,17 @@ btrfs-nocow migrate ~/.atuin/data --nocow --no-sudo                      # ス�
    - 実コピーの分の空き容量が無い
 
    計画の表を出して確認を求める（`--yes` で省略）。
-2. サービスを止める。そのうえで、対象のファイルを開いているプロセス（cwd・mmap を含む）や、中のマウントが残っていないかを確かめる。残っていれば止める。
+2. サービスやプロセスを止める。そのうえで、対象のファイルを開いているプロセス（cwd・mmap を含む）や、中のマウントが残っていないかを確かめる。残っていれば止める。
 3. 元を `<パス>.old` に rename し、新しいサブボリューム（またはディレクトリ）を作る。所有者・権限・拡張属性（ACL・SELinux）を写し、NOCOW にする範囲へ先に `chattr +C` を付ける。
 4. コピーする。
    - CoW のままの部分は `cp -a --reflink=auto`。同じファイルシステムなら、サブボリュームをまたいでもデータを共有するので一瞬で終わり、容量も増えない。
    - NOCOW の部分は `cp -a --reflink=never` で実際にコピーする。書き込み量で進捗を出す。
-5. 検証する。元と新しい側でファイル数・容量が一致すること、NOCOW の範囲の全ファイルに C 属性が付いていること、サブボリュームになっていることを確かめる。
-6. サービスとコンテナを起動し直す。
+5. 検証する。
+   - 元と新しい側で、ファイル数・容量が一致すること
+   - NOCOW の範囲の全ファイルに C 属性が付いていること
+   - サブボリュームになっていること
+   - コピーの間に対象を開いたプロセスがいないこと（シェルのフック等で自動で起動し直したプロセスなど）
+6. サービス・コンテナ・プロセスを起動し直す。
 
 途中で失敗したら（Ctrl+C を含む）、新しい側を消して `<パス>.old` を戻し、サービスを起動し直す。
 移行の記録は root なら `/var/lib/btrfs-nocow/state.json`、一般ユーザーなら `~/.local/state/btrfs-nocow/state.json` に残る。`rollback` と `cleanup` はこれを参照する。

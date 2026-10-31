@@ -9,6 +9,7 @@ BTRFS_NOCOW_TEST_DIR に btrfs 上のディレクトリを指定する（指定�
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -16,6 +17,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
@@ -375,3 +377,90 @@ def test_units_stopped_together_are_restarted(work: Path, monkeypatch: pytest.Mo
     assert ["systemctl", "stop", "x.service"] not in calls  # 既に止まっているので送らない
     starts = [c[2] for c in calls if c[:2] == ["systemctl", "start"]]
     assert starts == ["x.service", "x.socket"]
+
+
+# =====================================================================
+# atuin のプリセット
+# =====================================================================
+
+
+def test_atuin_data_dir_from_atuin_info(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """atuin info の client db path から置き場所を決める（版や ATUIN_HOME で場所が変わるため）。"""
+    data = tmp_path / "custom" / "atuin"
+    data.mkdir(parents=True)
+    exe = tmp_path / "atuin"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    monkeypatch.setattr(bn.shutil, "which", lambda name: str(exe))
+    monkeypatch.setattr(bn, "query", lambda cmd: f'client db path: "{data}/history.db"\nkey path: {data}/key\n' if cmd[-1] == "info" else None)
+    assert bn.atuin_data_dir(home=tmp_path) == data
+
+
+def test_atuin_data_dir_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """atuin info が使えなければ、よくある場所のうち history.db があるものを使う。"""
+    monkeypatch.setattr(bn, "query", lambda cmd: None)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    assert bn.atuin_data_dir(home=tmp_path) is None
+    d = tmp_path / ".local" / "share" / "atuin"
+    d.mkdir(parents=True)
+    (d / "history.db").write_bytes(b"")
+    assert bn.atuin_data_dir(home=tmp_path) == d
+
+
+def _spawn_fake_daemon(db: Path, marker: str) -> subprocess.Popen[bytes]:
+    """db を開いたまま待つプロセス（atuin のデーモンの代わり）。"""
+    code = "import sys, time\nf = open(sys.argv[1], 'ab')\ntime.sleep(300)\n"
+    proc = subprocess.Popen([sys.executable, "-c", code, str(db), marker])
+    for _ in range(50):  # ファイルを開くまで待つ
+        if bn.processes_using([db.parent]):
+            break
+        time.sleep(0.1)
+    return proc
+
+
+def _kill_marked(marker: str, comm: str) -> None:
+    """テストで起動し直されたプロセスを止める。"""
+    for pid in bn.find_processes((bn.ProcessMatch(comm, marker),)):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, 9)
+
+
+def test_preset_atuin_stops_and_restarts_daemon(work: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """デーモンを止めて NOCOW に移し、同じコマンドで起動し直す。"""
+    data = work / "atuin-data"
+    data.mkdir()
+    (data / "history.db").write_bytes(os.urandom(1 << 20))
+    (data / "key").write_text("secret\n")
+    marker = f"fake-atuin-daemon-{os.getpid()}"
+    proc = _spawn_fake_daemon(data / "history.db", marker)
+    comm = Path(f"/proc/{proc.pid}/comm").read_text().strip()
+    try:
+        preset = bn.Preset("テスト用", (), user_level=True,
+                           resolve_targets=lambda: (bn.TargetSpec(str(data), False, nocow_all=True),),
+                           stop_processes=(bn.ProcessMatch(comm, marker),))
+        monkeypatch.setitem(bn.PRESETS, "atuin", preset)
+        assert cli(work, "migrate", "--preset", "atuin") == 0
+        assert proc.wait(timeout=5) is not None  # 元のデーモンは止まった
+        assert bn.walk_tree(data, check_nocow=True).not_nocow == 0 and bn.get_nocow(data) is True
+        assert (work / "atuin-data.old").is_dir()
+        # 起動し直したデーモンが、新しい側のファイルを開いている
+        for _ in range(50):
+            if bn.processes_using([data]):
+                break
+            time.sleep(0.1)
+        assert bn.find_processes((bn.ProcessMatch(comm, marker),))
+        assert bn.processes_using([data])
+        record = bn.State(work / "state.json").migrations[str(data)]
+        assert record["stop_processes"] == [{"comm": comm, "arg": marker}]
+        assert "env" not in str(record)  # 環境変数は記録しない
+    finally:
+        proc.kill()
+        _kill_marked(marker, comm)
+
+
+def test_preset_atuin_refuses_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """一般ユーザー専用のプリセットを root で実行したら止める。"""
+    monkeypatch.setattr(bn.os, "geteuid", lambda: 0)
+    args = bn.build_parser().parse_args(["migrate", "--preset", "atuin"])
+    with pytest.raises(bn.MigrationError):
+        bn.specs_from_args(args)

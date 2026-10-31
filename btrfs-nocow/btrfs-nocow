@@ -36,6 +36,7 @@ import pwd
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -483,7 +484,6 @@ KNOWN: list[Known] = [
     Known("/var/lib/postgresql", "PostgreSQL", True, nocow_all=True, preset="postgresql"),
     Known("/var/lib/mongodb", "MongoDB", True, nocow_all=True, preset="mongodb"),
     Known("/var/log/journal", "systemd-journald", False, nocow_all=True, note="systemd の journal-nocow.conf が自動で +C を付ける"),
-    Known("~/.atuin/data", "atuin（シェル履歴の SQLite）", False, nocow_all=True, note="常に書き込まれる SQLite"),
 ]
 
 
@@ -616,6 +616,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
         if str(expand(d)) not in known_paths:
             items.append(Known(d, "libvirt のプール", True, nocow_all=True))
             known_paths.add(str(expand(d)))
+    atuin_dir = atuin_data_dir()
+    if atuin_dir and str(atuin_dir) not in known_paths:
+        items.append(Known(str(atuin_dir), "atuin（シェル履歴の SQLite）", False, nocow_all=True, preset="atuin", note="常に書き込まれる SQLite"))
+        known_paths.add(str(atuin_dir))
     t = Table(title="よくある置き場所", title_justify="left")
     for col in ("判定", "場所", "種類", "容量", "サブボリューム", "スナップショット", "NOCOW", "理由・対処"):
         t.add_column(col, overflow="fold")
@@ -761,6 +765,15 @@ class TargetSpec:
     subvolume: bool
     nocow_all: bool = False
     nocow_subdirs: tuple[str, ...] = ()
+    keep_in_snapshot: bool = False  # スナップショットで守りたいので、わざとサブボリュームにしない
+
+
+@dataclass(frozen=True)
+class ProcessMatch:
+    """止めるユーザープロセス。名前（comm）が一致し、コマンドラインに arg を含むもの。"""
+
+    comm: str
+    arg: str = ""
 
 
 @dataclass(frozen=True)
@@ -772,6 +785,36 @@ class Preset:
     stop_units: tuple[str, ...] = ()  # 止める順。再開は逆順
     restore_docker: bool = False  # 移行前に動いていた Docker のコンテナを起動し直す
     forbid_process_prefixes: tuple[str, ...] = ()  # 停止後に残っていたら中止するプロセス名（comm）の接頭辞
+    user_level: bool = False  # 自分のデータなので sudo を使わず一般ユーザーで実行する
+    resolve_targets: Callable[[], tuple[TargetSpec, ...]] | None = None  # 対象を実行時に調べる（targets の代わり）
+    stop_processes: tuple[ProcessMatch, ...] = ()  # 止めて、終わったら同じコマンドで起動し直すユーザープロセス
+
+
+def atuin_data_dir(home: Path | None = None) -> Path | None:
+    """atuin のデータ（history.db 等）の置き場所。
+
+    一般ユーザーなら `atuin info` の client db path から調べる（版や ATUIN_HOME で場所が変わるため）。
+    調べられなければ、よくある場所（~/.atuin/data、~/.local/share/atuin）のうち history.db があるもの。
+    root（scan --sudo）のときは root の設定を見てしまうので atuin info は使わず、呼び出したユーザーのホームで探す。
+    """
+    home = home or invoking_user().home
+    if os.geteuid() != 0:
+        exe = shutil.which("atuin") or str(home / ".atuin" / "bin" / "atuin")
+        out = query([exe, "info"]) if os.access(exe, os.X_OK) else None
+        m = re.search(r"^client db path:\s*\"?(.+?)\"?\s*$", out or "", re.MULTILINE)
+        if m and os.path.isdir(Path(m[1]).parent):
+            return Path(os.path.abspath(Path(m[1]).parent))
+    xdg = os.environ.get("XDG_DATA_HOME") if os.geteuid() != 0 else None
+    for d in (home / ".atuin" / "data", Path(xdg or home / ".local" / "share") / "atuin"):
+        if (d / "history.db").is_file():
+            return d
+    return None
+
+
+def _atuin_targets() -> tuple[TargetSpec, ...]:
+    """atuin のプリセットの対象（スナップショットで履歴を守るため、サブボリュームにはしない）。"""
+    d = atuin_data_dir()
+    return (TargetSpec(str(d), False, nocow_all=True, keep_in_snapshot=True),) if d else ()
 
 
 PRESETS: dict[str, Preset] = {
@@ -792,6 +835,13 @@ PRESETS: dict[str, Preset] = {
     "mysql": Preset("MySQL / MariaDB のデータをサブボリュームにして NOCOW にする", (TargetSpec("/var/lib/mysql", True, nocow_all=True),), ("mysql.service", "mariadb.service")),
     "postgresql": Preset("PostgreSQL のデータをサブボリュームにして NOCOW にする", (TargetSpec("/var/lib/postgresql", True, nocow_all=True),), ("postgresql.service",)),
     "mongodb": Preset("MongoDB のデータをサブボリュームにして NOCOW にする", (TargetSpec("/var/lib/mongodb", True, nocow_all=True),), ("mongod.service",)),
+    "atuin": Preset(
+        "atuin（シェル履歴）の SQLite を NOCOW にする。一般ユーザーで実行し、デーモンを止めて終わったら起動し直す",
+        (),
+        user_level=True,
+        resolve_targets=_atuin_targets,
+        stop_processes=(ProcessMatch("atuin", "daemon"),),
+    ),
 }
 
 
@@ -919,6 +969,71 @@ def restore_docker_containers(names: list[str]) -> None:
         log(f"起動していないコンテナ: {', '.join(sorted(missing))}", "bold red")
 
 
+def _proc_alive(pid: int) -> bool:
+    """プロセスが生きているか（終了してゾンビになったものは終わったとみなす）。"""
+    try:
+        st = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return st.rsplit(")", 1)[-1].split()[0] != "Z"
+
+
+def find_processes(matches: tuple[ProcessMatch, ...]) -> list[int]:
+    """自分のプロセスのうち、matches のどれかに当たるもの。"""
+    uid, me = os.getuid(), os.getpid()
+    pids: list[int] = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit() or int(name) == me:
+            continue
+        try:
+            if os.stat(f"/proc/{name}").st_uid != uid:
+                continue
+            comm = Path(f"/proc/{name}/comm").read_text().strip()
+            cmdline = Path(f"/proc/{name}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        if _proc_alive(int(name)) and any(comm == m.comm and m.arg in cmdline for m in matches):
+            pids.append(int(name))
+    return pids
+
+
+def stop_processes(matches: tuple[ProcessMatch, ...], stopped: list[dict[str, Any]], timeout: float = 10.0) -> None:
+    """当たるプロセスのコマンドライン・環境変数・作業ディレクトリを控えてから SIGTERM で止める。"""
+    pids = find_processes(matches)
+    for pid in pids:
+        try:
+            argv = [a.decode(errors="surrogateescape") for a in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if a]
+            env = dict(
+                kv.decode(errors="surrogateescape").split("=", 1)
+                for kv in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+                if b"=" in kv
+            )
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            continue
+        log(f"+ kill -TERM {pid}（{shlex.join(argv)}）", "yellow")
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGTERM)
+        stopped.append({"argv": argv, "env": env, "cwd": cwd})
+    deadline = time.monotonic() + timeout
+    while any(_proc_alive(p) for p in pids):
+        if time.monotonic() > deadline:
+            raise MigrationError(f"プロセスが止まらない: {[p for p in pids if _proc_alive(p)]}")
+        time.sleep(0.1)
+
+
+def restart_processes(stopped: list[dict[str, Any]]) -> None:
+    """stop_processes で止めたものを、同じコマンド・環境変数・作業ディレクトリで起動し直す。"""
+    for p in stopped:
+        cwd = p["cwd"] if os.path.isdir(p["cwd"]) else str(invoking_user().home)
+        log(f"+ {shlex.join(p['argv'])}（起動し直す）", "yellow")
+        try:
+            subprocess.Popen(p["argv"], cwd=cwd, env=p.get("env") or os.environ.copy(), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            log(f"起動できなかった: {e}（手で `{shlex.join(p['argv'])}` を実行する）", "bold red")
+
+
 # ---- 開いているプロセスの確認 ----
 
 
@@ -1030,8 +1145,6 @@ def make_plan(spec: TargetSpec, mounts: list[Mount], configs: list[SnapshotConfi
     if m.mount_point == str(path):
         plan.errors.append("マウントポイントは対象外（既に別にマウントされている。中身だけ移すなら別の方法で）")
         return plan
-    if old_path(path).exists():
-        plan.errors.append(f"{old_path(path)} が既にある（前回の移行の残りなら cleanup か rollback を先に）")
     if not spec.subvolume and is_subvolume_root(path):
         plan.subvolume = True
         plan.warnings.append("既にサブボリュームなので、サブボリュームのまま作り直す")
@@ -1039,7 +1152,10 @@ def make_plan(spec: TargetSpec, mounts: list[Mount], configs: list[SnapshotConfi
     cfg = snapshot_config_for(sv, configs) if not is_subvolume_root(path) else None
     plan.snapshot = cfg.name if cfg else ""
     if cfg and not plan.subvolume and (spec.nocow_all or spec.nocow_subdirs):
-        plan.warnings.append(f"snapper「{cfg.name}」の対象の中なので、NOCOW だけでは効果が薄い（--subvolume を推奨）")
+        if spec.keep_in_snapshot:
+            plan.warnings.append(f"snapper「{cfg.name}」で守るため、サブボリュームにはしない（スナップショットの後の書き込みは一度 CoW される）")
+        else:
+            plan.warnings.append(f"snapper「{cfg.name}」の対象の中なので、NOCOW だけでは効果が薄い（--subvolume を推奨）")
     for s in spec.nocow_subdirs:
         if not os.path.isdir(path / s):
             plan.warnings.append(f"{s} が無いので NOCOW にしない（後から作られると CoW になる）")
@@ -1049,7 +1165,10 @@ def make_plan(spec: TargetSpec, mounts: list[Mount], configs: list[SnapshotConfi
     nocow_ok = not (plan.nocow_all or plan.nocow_subdirs) or nocow_is_satisfied(path, plan.nocow_all, plan.nocow_subdirs)
     if subvol_ok and nocow_ok:
         plan.skip = "対応済み"
+        plan.warnings = [w for w in plan.warnings if "snapper" not in w]  # 何もしないので、移行の注意は出さない
         return plan
+    if old_path(path).exists():
+        plan.errors.append(f"{old_path(path)} が既にある（前回の移行の残りなら cleanup か rollback を先に）")
     plan.stats = walk_with_status(path, str(path), mount_points={x.mount_point for x in mounts})
     if plan.stats.nested_subvolumes:
         plan.errors.append("入れ子のサブボリュームがある（コピーすると普通のディレクトリになってしまう）: " + ", ".join(plan.stats.nested_subvolumes[:5]))
@@ -1257,8 +1376,13 @@ def specs_from_args(args: argparse.Namespace) -> tuple[list[TargetSpec], Preset 
         if args.paths or args.nocow or args.nocow_subdir or args.subvolume:
             raise MigrationError("--preset と、パス・--subvolume・--nocow・--nocow-subdir は同時に指定できない")
         preset = PRESETS[args.preset]
-        specs = [t for t in preset.targets if os.path.isdir(expand(t.path))]
-        for t in preset.targets:
+        if preset.user_level and os.geteuid() == 0:
+            raise MigrationError(f"--preset {args.preset} は自分のデータなので、sudo を付けずに一般ユーザーで実行する")
+        targets = preset.resolve_targets() if preset.resolve_targets else preset.targets
+        if not targets:
+            log(f"{args.preset} のデータが見つからない", "yellow")
+        specs = [t for t in targets if os.path.isdir(expand(t.path))]
+        for t in targets:
             if t not in specs:
                 log(f"{t.path} が無いのでスキップ", "dim")
         return specs, preset
@@ -1298,8 +1422,11 @@ def cmd_migrate(args: argparse.Namespace) -> int:
             human(p.nocow_bytes) if p.stats else "", p.snapshot or "—", Text("\n").join(notes),
         )
     log.table(t)
+    matches = preset.stop_processes if preset else ()
     if units:
         log(f"止めるサービス（動いているものだけ。終わったら逆順に起動する）: {', '.join(units)}")
+    if matches:
+        log(f"止めるプロセス（終わったら同じコマンドで起動し直す）: {', '.join(f'{m.comm}（{m.arg}）' if m.arg else m.comm for m in matches)}")
     if any(p.errors for p in plans):
         log("問題があるので中止する", "bold red")
         return 1
@@ -1325,9 +1452,11 @@ def cmd_migrate(args: argparse.Namespace) -> int:
             log(f"移行前に動いているコンテナ: {', '.join(containers)}")
         started = time.monotonic()
         stopped: list[str] = []
+        stopped_procs: list[dict[str, Any]] = []
         done: list[Plan] = []
         try:
             stop_units(units, stopped)
+            stop_processes(matches, stopped_procs)
             # 止めた後に、まだ使っているものが無いかを確かめる
             paths = [p.path for p in todo]
             busy = processes_using(paths)
@@ -1343,11 +1472,19 @@ def cmd_migrate(args: argparse.Namespace) -> int:
                 state.migrations[str(p.path)] = {
                     "path": str(p.path), "old": str(p.old), "subvolume": p.subvolume, "nocow_all": p.nocow_all,
                     "nocow_subdirs": p.nocow_subdirs, "stopped_units": stopped, "docker_containers": containers,
+                    # 環境変数には秘密が含まれうるので記録しない（rollback では止めたときの環境で起動し直す）
+                    "stop_processes": [{"comm": m.comm, "arg": m.arg} for m in matches],
                     "status": "copying", "started": dt.datetime.now().isoformat(timespec="seconds"), "log": str(log.path or ""),
                 }
                 state.save()
                 done.append(p)
                 migrate_one(p, mps)
+                # コピーの間に開かれていないか（シェルのフック等で自動で起動し直したプロセスなど）
+                late = processes_using([p.path, p.old])
+                if late:
+                    for b in late:
+                        log(f"  使用中: {b}", "red")
+                    raise MigrationError("コピーの間に対象を開いたプロセスがある（止めてからやり直す）")
                 state.migrations[str(p.path)]["status"] = "done"
                 state.migrations[str(p.path)]["finished"] = dt.datetime.now().isoformat(timespec="seconds")
                 state.save()
@@ -1364,11 +1501,14 @@ def cmd_migrate(args: argparse.Namespace) -> int:
                 state.save()
             start_units(stopped)
             restore_docker_containers(containers)
+            restart_processes(stopped_procs)
             return 1
         start_units(stopped)
         restore_docker_containers(containers)
+        restart_processes(stopped_procs)
     log(f"完了（停止していた時間: {time.monotonic() - started:.0f} 秒）", "bold green")
-    log(f"動作を確認したら `btrfs-nocow cleanup` で {', '.join(str(p.old) for p in todo)} を削除する（戻すなら `btrfs-nocow rollback`）")
+    opt = "" if os.geteuid() == 0 else " --no-sudo"  # 一般ユーザーの記録は sudo なしで扱う
+    log(f"動作を確認したら `btrfs-nocow cleanup{opt}` で {', '.join(str(p.old) for p in todo)} を削除する（戻すなら `btrfs-nocow rollback{opt}`）")
     log("古いスナップショットが参照している分は、cleanup の後も保持期限が切れるまで容量が戻らない", "dim")
     return 0
 
@@ -1402,9 +1542,12 @@ def cmd_rollback(args: argparse.Namespace) -> int:
             return 0
         units = list(dict.fromkeys(u for r in recs for u in r.get("stopped_units", [])))
         containers = list(dict.fromkeys(c for r in recs for c in r.get("docker_containers", [])))
+        matches = tuple(dict.fromkeys(ProcessMatch(**m) for r in recs for m in r.get("stop_processes", [])))
         stopped: list[str] = []
+        stopped_procs: list[dict[str, Any]] = []
         try:
             stop_units(units, stopped)
+            stop_processes(matches, stopped_procs)
             busy = processes_using([Path(r["path"]) for r in recs])
             if busy:
                 for b in busy:
@@ -1417,6 +1560,7 @@ def cmd_rollback(args: argparse.Namespace) -> int:
         finally:
             start_units(stopped)
             restore_docker_containers(containers)
+            restart_processes(stopped_procs)
     log("元に戻した", "bold green")
     return 0
 
@@ -1461,7 +1605,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=f"プリセット（migrate --preset）:\n{presets}\n\n例:\n"
         "  btrfs-nocow scan\n"
         "  btrfs-nocow migrate --preset docker --dry-run\n"
-        "  btrfs-nocow migrate ~/.atuin/data --nocow --no-sudo   # 自分のディレクトリ（書き込むプロセスは先に止める）\n"
+        "  btrfs-nocow migrate --preset atuin                     # 一般ユーザーのまま（デーモンも止めて起動し直す）\n"
+        "  btrfs-nocow migrate ~/data --nocow --no-sudo           # 自分のディレクトリ（書き込むプロセスは先に止める）\n"
         "  btrfs-nocow migrate /srv/vm --subvolume --nocow\n"
         "  btrfs-nocow cleanup",
     )
@@ -1515,7 +1660,8 @@ def main(argv: list[str] | None = None) -> int:
     if os.geteuid() != 0:
         if args.command == "scan" and args.sudo:
             reexec_with_sudo(argv)
-        if args.command in ("migrate", "rollback", "cleanup") and not args.no_sudo:
+        user_level = args.command == "migrate" and args.preset and PRESETS[args.preset].user_level
+        if args.command in ("migrate", "rollback", "cleanup") and not args.no_sudo and not user_level:
             reexec_with_sudo(argv)
     log.open(args.log or default_log_path(args.command))
     log(f"btrfs-nocow {shlex.join(argv)}（ログ: {log.path}。`tail -f` で経過を追える）", "dim")
