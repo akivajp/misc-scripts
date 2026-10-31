@@ -1,0 +1,1530 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["rich>=13"]
+# ///
+"""btrfs-nocow: btrfs で CoW を切るべき場所を洗い出し、サブボリューム化・NOCOW 化して移し替える。
+
+- scan      洗い出し。サブボリュームと snapper の構成、よくある置き場所（Docker・libvirt・DB 等）と
+            大きな DB・VM イメージの状態を表にし、対処が要るかを判定する（root なしでも動く）
+- migrate   ディレクトリを作り直す。元を <パス>.old に退避し、新しいサブボリューム（またはディレクトリ）に
+            NOCOW を付けてからコピーし、ファイル数・容量・属性を検証する。失敗したら自動で元に戻す
+- rollback  migrate の前の状態に戻す（<パス>.old を元の場所へ）
+- cleanup   動作確認が済んだ後に <パス>.old を削除する
+
+判断基準の要点:
+- 大きなファイルの中をランダムに上書きするもの（VM イメージ、DB）は NOCOW にする
+- snapper 等でスナップショットされる場所では、NOCOW でもスナップショット後の最初の書き込みで CoW される。
+  そのため DB・VM・Docker は「別のサブボリューム（スナップショット対象外）＋ NOCOW」をセットにする
+- 書いたら読むだけのもの（モデル、ISO、イメージ層）はチェックサムを残すため CoW のままにする
+
+ログは呼び出したユーザーの ~/logs/btrfs-nocow/ に書く（`tail -f` で経過を追える）。
+migrate の記録は root なら /var/lib/btrfs-nocow/state.json、一般ユーザーなら
+~/.local/state/btrfs-nocow/state.json に残し、rollback / cleanup が参照する。
+"""
+
+from __future__ import annotations
+
+import argparse
+import array
+import contextlib
+import datetime as dt
+import fcntl
+import json
+import os
+import pwd
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from rich.console import Console
+from rich.progress import BarColumn, DownloadColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, TransferSpeedColumn
+from rich.prompt import Confirm
+from rich.table import Table
+from rich.text import Text
+
+# ---- カーネルの定数 ----
+FS_IOC_GETFLAGS = 0x80086601  # ファイル属性（lsattr で見えるもの）の取得
+FS_NOCOW_FL = 0x00800000  # chattr +C
+BTRFS_SUBVOL_ROOT_INO = 256  # btrfs のサブボリュームの根のディレクトリの inode 番号
+
+OLD_SUFFIX = ".old"  # 退避先の接尾辞
+PROGRESS_LOG_INTERVAL = 30.0  # コピー中にログファイルへ経過を書く間隔 [秒]
+
+# 外部コマンドの出力を言語の設定によらず同じ形で読むため
+CMD_ENV = {**os.environ, "LC_ALL": "C.UTF-8"}
+
+# 洗い出しで「VM イメージ」「DB」とみなす拡張子・ファイル名
+VM_SUFFIXES = {".qcow2", ".img", ".raw", ".vdi", ".vmdk", ".vhd", ".vhdx"}
+DB_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".ibd", ".mdb", ".wt", ".duckdb"}
+DB_NAMES = {"ibdata1", "data.mdb"}
+# 洗い出しで中を見ないディレクトリ名（DB・VM イメージを含まず、数が多くて遅くなるもの）
+SCAN_PRUNE_NAMES = {".git", "node_modules", ".snapshots", "__pycache__"}
+# これより小さい置き場所は「ほぼ空」として対処不要と判定する
+EMPTY_THRESHOLD = 16 << 20
+
+
+class MigrationError(Exception):
+    """移行を続けられない問題（利用者に見せるメッセージを持つ）。"""
+
+
+# =====================================================================
+# ログ（画面とログファイルの両方に書く）
+# =====================================================================
+
+
+class Log:
+    """画面（rich）とログファイルの両方に、日時付きで書き出す。"""
+
+    def __init__(self) -> None:
+        self.console = Console()
+        self.file_console: Console | None = None
+        self.path: Path | None = None
+
+    def open(self, path: Path) -> None:
+        """ログファイルを開く（親ディレクトリも作る）。sudo 経由なら呼び出したユーザーの所有にする。"""
+        missing = [d for d in (path.parent, *path.parent.parents) if not d.exists()]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a", encoding="utf-8")  # noqa: SIM115 - プロセスの終了まで開いておく
+        self.file_console = Console(file=fh, width=220, color_system=None, force_terminal=False, soft_wrap=True)
+        self.path = path
+        for d in missing:
+            give_to_invoking_user(d)
+        give_to_invoking_user(path)
+
+    def __call__(self, msg: str, style: str = "") -> None:
+        """1行のメッセージ。msg は rich のマークアップとして解釈しない（パスに [ ] が含まれても崩れない）。"""
+        ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = Text.assemble((f"[{ts}] ", "dim"), (msg, style))
+        self.console.print(line)
+        if self.file_console:
+            self.file_console.print(f"[{ts}] {msg}", markup=False, highlight=False)
+
+    def table(self, table: Table) -> None:
+        """表を画面とログファイルに出す。"""
+        self.console.print(table)
+        if self.file_console:
+            self.file_console.print(table)
+
+    def plain(self, msg: str) -> None:
+        """日時なしの行（コマンドの出力の転記など）。"""
+        self.console.print(msg, markup=False, highlight=False)
+        if self.file_console:
+            self.file_console.print(msg, markup=False, highlight=False)
+
+
+log = Log()
+
+
+# =====================================================================
+# 小物
+# =====================================================================
+
+
+def human(n: int | float | None) -> str:
+    """バイト数を KiB / MiB / GiB の表記にする。"""
+    if n is None:
+        return "?"
+    value = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(value) < 1024 or unit == "TiB":
+            return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TiB"
+
+
+def parse_size(s: str) -> int:
+    """'32M' や '1G' をバイト数にする（2 の累乗の単位）。"""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]?)i?B?\s*", s, re.IGNORECASE)
+    if not m:
+        raise argparse.ArgumentTypeError(f"大きさの形式が不正: {s}（例: 32M, 1G）")
+    mult = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}[m[2].upper()]
+    return int(float(m[1]) * mult)
+
+
+@dataclass(frozen=True)
+class InvokingUser:
+    """sudo で起動し直していても、元のユーザーを指す。"""
+
+    name: str
+    uid: int
+    gid: int
+    home: Path
+
+
+def invoking_user() -> InvokingUser:
+    """呼び出したユーザー（sudo なら SUDO_USER、そうでなければ自分）。"""
+    name = os.environ.get("SUDO_USER") if os.geteuid() == 0 else None
+    pw = pwd.getpwnam(name) if name else pwd.getpwuid(os.getuid())
+    return InvokingUser(pw.pw_name, pw.pw_uid, pw.pw_gid, Path(pw.pw_dir))
+
+
+def give_to_invoking_user(path: Path) -> None:
+    """root で作ったログ等を、sudo を呼んだユーザーの所有にする（後で一般ユーザーが読み書きできるように）。"""
+    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+        u = invoking_user()
+        with contextlib.suppress(OSError):
+            os.chown(path, u.uid, u.gid)
+
+
+def expand(path: str) -> Path:
+    """'~' を呼び出したユーザーのホームに展開し、絶対パスにする（シンボリックリンクは解決しない）。"""
+    if path == "~" or path.startswith("~/"):
+        path = str(invoking_user().home) + path[1:]
+    return Path(os.path.abspath(path))
+
+
+def run(cmd: list[str], *, check: bool = True, quiet: bool = False) -> subprocess.CompletedProcess[str]:
+    """変更を伴うコマンドを、内容をログに残してから実行する。"""
+    if not quiet:
+        log(f"+ {shlex.join(cmd)}", "yellow")
+    res = subprocess.run(cmd, capture_output=True, text=True, env=CMD_ENV)
+    for line in (res.stdout + res.stderr).splitlines():
+        if line.strip() and not quiet:
+            log.plain(f"    {line}")
+    if check and res.returncode != 0:
+        raise MigrationError(f"コマンドが失敗した（終了コード {res.returncode}）: {shlex.join(cmd)}\n{res.stderr.strip()}")
+    return res
+
+
+def query(cmd: list[str]) -> str | None:
+    """読み取りだけのコマンドの標準出力（失敗・未導入なら None）。"""
+    if not shutil.which(cmd[0]):
+        return None
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, env=CMD_ENV, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return res.stdout if res.returncode == 0 else None
+
+
+# =====================================================================
+# ファイルシステムの情報
+# =====================================================================
+
+
+@dataclass(frozen=True)
+class Mount:
+    """/proc/self/mountinfo の1行。"""
+
+    mount_point: str
+    root: str  # btrfs ならマウントしているサブボリュームのパス（例: /@home）
+    fstype: str
+    source: str
+    super_options: str
+
+
+def _unescape_mountinfo(s: str) -> str:
+    """mountinfo の 8 進エスケープ（空白は \\040）を戻す。"""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), s)
+
+
+def parse_mountinfo(text: str) -> list[Mount]:
+    """mountinfo の本文を Mount のリストにする。"""
+    mounts: list[Mount] = []
+    for line in text.splitlines():
+        left, sep, right = line.partition(" - ")
+        if not sep:
+            continue
+        lf, rf = left.split(), right.split()
+        if len(lf) < 5 or len(rf) < 2:
+            continue
+        mounts.append(
+            Mount(
+                mount_point=_unescape_mountinfo(lf[4]),
+                root=_unescape_mountinfo(lf[3]),
+                fstype=rf[0],
+                source=_unescape_mountinfo(rf[1]),
+                super_options=rf[2] if len(rf) > 2 else "",
+            )
+        )
+    return mounts
+
+
+def read_mounts() -> list[Mount]:
+    """現在のマウントの一覧。"""
+    return parse_mountinfo(Path("/proc/self/mountinfo").read_text())
+
+
+def is_under(path: str, parent: str) -> bool:
+    """path が parent 自身かその下にあるか（文字列で判定）。"""
+    parent = parent.rstrip("/") or "/"
+    return path == parent or path.startswith(parent if parent == "/" else parent + "/")
+
+
+def mount_of(path: Path, mounts: list[Mount]) -> Mount | None:
+    """path を含むマウント（最も深いもの）。"""
+    best: Mount | None = None
+    for m in mounts:
+        if is_under(str(path), m.mount_point) and (best is None or len(m.mount_point) >= len(best.mount_point)):
+            best = m
+    return best
+
+
+def is_subvolume_root(path: Path) -> bool:
+    """btrfs のサブボリュームの根か（root なしでも判定できる）。"""
+    try:
+        return os.lstat(path).st_ino == BTRFS_SUBVOL_ROOT_INO and stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def containing_subvolume(path: Path, mounts: list[Mount]) -> Path:
+    """path を含むサブボリュームの根（path 自身が根ならそれ）。マウントの境界は越えない。"""
+    m = mount_of(path, mounts)
+    stop = Path(m.mount_point) if m else Path("/")
+    p = path
+    while True:
+        if is_subvolume_root(p) or p == stop or p.parent == p:
+            return p
+        p = p.parent
+
+
+def get_nocow(path: Path) -> bool | None:
+    """NOCOW（chattr +C）が付いているか。読めなければ None。通常ファイルとディレクトリ以外には使わないこと。"""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_NOCTTY)
+    except OSError:
+        return None
+    try:
+        buf = array.array("i", [0])
+        fcntl.ioctl(fd, FS_IOC_GETFLAGS, buf, True)
+        return bool(buf[0] & FS_NOCOW_FL)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def extent_count(path: Path) -> int | None:
+    """filefrag によるエクステント数（断片化の目安）。"""
+    out = query(["filefrag", str(path)])
+    m = re.search(r"(\d+) extents? found", out or "")
+    return int(m[1]) if m else None
+
+
+# ---- snapper ----
+
+
+@dataclass(frozen=True)
+class SnapshotConfig:
+    """スナップショットを取っている設定（snapper の config）。"""
+
+    name: str
+    subvolume: str
+    timeline: bool | None  # None は不明（設定ファイルを読めなかった）
+
+
+def parse_snapper_config(text: str) -> dict[str, str]:
+    """snapper の設定ファイル（KEY="value" 形式）を辞書にする。"""
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        m = re.match(r'^\s*([A-Z_]+)="(.*)"\s*$', line)
+        if m:
+            out[m[1]] = m[2]
+    return out
+
+
+def read_snapshot_configs() -> list[SnapshotConfig]:
+    """snapper の設定の一覧。設定ファイルが読めなければ `snapper list-configs` で補う。"""
+    configs: list[SnapshotConfig] = []
+    cfg_dir = Path("/etc/snapper/configs")
+    unreadable = False
+    if os.path.isdir(cfg_dir):
+        for f in sorted(cfg_dir.iterdir()):
+            try:
+                kv = parse_snapper_config(f.read_text())
+            except OSError:
+                unreadable = True
+                continue
+            if "SUBVOLUME" in kv:
+                configs.append(SnapshotConfig(f.name, kv["SUBVOLUME"], kv.get("TIMELINE_CREATE", "no") == "yes"))
+    if unreadable:
+        out = query(["snapper", "--csvout", "--no-headers", "list-configs"]) or ""
+        known = {c.name for c in configs}
+        for line in out.splitlines():
+            name, _, subvol = line.partition(",")
+            if name and subvol and name not in known:
+                configs.append(SnapshotConfig(name, subvol, None))
+    return configs
+
+
+def snapshot_config_for(subvol_root: Path, configs: list[SnapshotConfig]) -> SnapshotConfig | None:
+    """サブボリュームの根をスナップショットしている設定。"""
+    for c in configs:
+        if os.path.realpath(c.subvolume) == os.path.realpath(subvol_root):
+            return c
+    return None
+
+
+# ---- ディレクトリの中身の集計 ----
+
+
+@dataclass
+class TreeStats:
+    """ディレクトリの下の集計（根自身は数えない）。"""
+
+    entries: int = 0  # ファイル・ディレクトリ・リンク等の数
+    files: int = 0  # 通常ファイルの数
+    bytes: int = 0  # 通常ファイルの大きさの合計（見かけの大きさ）
+    not_nocow: int = 0  # check_nocow のとき、NOCOW でない通常ファイル・ディレクトリの数
+    nested_subvolumes: list[str] = field(default_factory=list)
+    mounts: list[str] = field(default_factory=list)
+    unreadable: int = 0
+    truncated: bool = False  # time_limit で打ち切った
+
+
+def walk_tree(
+    root: Path,
+    *,
+    check_nocow: bool = False,
+    mount_points: set[str] | None = None,
+    time_limit: float | None = None,
+    on_progress: Callable[[TreeStats], None] | None = None,
+) -> TreeStats:
+    """root の下を数える。別のマウントと入れ子のサブボリュームには入らない（数だけ記録する）。"""
+    st = TreeStats()
+    root_dev = os.lstat(root).st_dev
+    mps = mount_points if mount_points is not None else {m.mount_point for m in read_mounts()}
+    stack = [str(root)]
+    start = last = time.monotonic()
+    while stack:
+        d = stack.pop()
+        try:
+            it = os.scandir(d)
+        except OSError:
+            st.unreadable += 1
+            continue
+        with it:
+            for e in it:
+                st.entries += 1
+                try:
+                    s = e.stat(follow_symlinks=False)
+                except OSError:
+                    st.unreadable += 1
+                    continue
+                if stat.S_ISDIR(s.st_mode):
+                    if e.path in mps:
+                        st.mounts.append(e.path)
+                        continue
+                    if s.st_dev != root_dev:  # btrfs の入れ子のサブボリュームは st_dev が変わる
+                        st.nested_subvolumes.append(e.path)
+                        continue
+                    if check_nocow and get_nocow(Path(e.path)) is False:
+                        st.not_nocow += 1
+                    stack.append(e.path)
+                elif stat.S_ISREG(s.st_mode):
+                    st.files += 1
+                    st.bytes += s.st_size
+                    if check_nocow and get_nocow(Path(e.path)) is False:
+                        st.not_nocow += 1
+        now = time.monotonic()
+        if on_progress and now - last > 0.2:
+            on_progress(st)
+            last = now
+        if time_limit is not None and now - start > time_limit:
+            st.truncated = True
+            break
+    return st
+
+
+# 注意: ディレクトリの判定は Path.is_dir ではなく os.path.isdir を使う。
+# Path.is_dir は Python の版によって、root しか開けない場所で PermissionError を投げるため。
+
+
+def walk_with_status(root: Path, label: str, **kwargs: Any) -> TreeStats:
+    """walk_tree を、件数の出るスピナー付きで実行する。"""
+    with log.console.status(f"{label}: 数えています…") as status:
+
+        def show(s: TreeStats) -> None:
+            status.update(f"{label}: {s.entries:,} 件 / {human(s.bytes)}")
+
+        return walk_tree(root, on_progress=show, **kwargs)
+
+
+# =====================================================================
+# 判定（scan）
+# =====================================================================
+
+
+@dataclass(frozen=True)
+class Known:
+    """よくある置き場所と、そこに望ましい形。"""
+
+    path: str  # '~' は呼び出したユーザーのホーム
+    label: str
+    want_subvolume: bool  # スナップショット対象の中なら、サブボリュームとして切り出すべきか
+    nocow_all: bool = False  # 全体を NOCOW にすべきか
+    nocow_subdirs: tuple[str, ...] = ()  # NOCOW にすべきサブディレクトリ（相対パス）
+    preset: str | None = None
+    note: str = ""
+
+
+KNOWN: list[Known] = [
+    Known("/var/lib/docker", "Docker", True, nocow_subdirs=("volumes",), preset="docker", note="イメージ層は CoW のまま、DB を持つボリュームだけ NOCOW"),
+    Known("/var/lib/containerd", "containerd", True, preset="docker", note="イメージの展開先。スナップショットから外すだけ"),
+    Known("/var/lib/containers", "Podman（root）", True, nocow_subdirs=("storage/volumes",), preset="podman"),
+    Known("~/.local/share/containers", "Podman（rootless）", True, nocow_subdirs=("storage/volumes",)),
+    Known("~/.local/share/docker", "Docker（rootless）", True, nocow_subdirs=("volumes",)),
+    Known("/var/lib/libvirt/images", "libvirt の既定プール", True, nocow_all=True, preset="libvirt"),
+    Known("~/.local/share/libvirt/images", "libvirt（ユーザーセッション）", True, nocow_all=True),
+    Known("~/.local/share/gnome-boxes/images", "GNOME Boxes", True, nocow_all=True),
+    Known("~/VirtualBox VMs", "VirtualBox", True, nocow_all=True),
+    Known("/var/lib/mysql", "MySQL / MariaDB", True, nocow_all=True, preset="mysql"),
+    Known("/var/lib/postgresql", "PostgreSQL", True, nocow_all=True, preset="postgresql"),
+    Known("/var/lib/mongodb", "MongoDB", True, nocow_all=True, preset="mongodb"),
+    Known("/var/log/journal", "systemd-journald", False, nocow_all=True, note="systemd の journal-nocow.conf が自動で +C を付ける"),
+    Known("~/.atuin/data", "atuin（シェル履歴の SQLite）", False, nocow_all=True, note="常に書き込まれる SQLite"),
+]
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """判定の結果。"""
+
+    status: str  # 対応済み / 推奨 / 任意 / 不要 / 要 root / 無し
+    reason: str
+    command: str = ""  # 対処のコマンド例
+
+
+def judge_location(
+    *,
+    path: str,
+    exists: bool,
+    want_subvolume: bool,
+    want_nocow: bool,
+    nocow_subdirs: tuple[str, ...],
+    is_subvol: bool,
+    in_snapshot: bool | None,
+    nocow: bool | None,
+    preset: str | None,
+    size: int | None = None,
+) -> Verdict:
+    """置き場所が望ましい形になっているかを判定する（nocow は全体または対象のサブディレクトリの状態、size は数えられたときの容量）。"""
+    if not exists:
+        return Verdict("無し", "")
+    if size is not None and size < EMPTY_THRESHOLD:
+        return Verdict("不要", "中身がほぼ空（使い始める前に移すなら推奨の形にできる）")
+    wants_any_nocow = want_nocow or bool(nocow_subdirs)
+    if wants_any_nocow and nocow is None:
+        return Verdict("要 root", "属性を読めない（sudo で実行すると判定できる）")
+    need_subvol = want_subvolume and bool(in_snapshot) and not is_subvol
+    need_nocow = wants_any_nocow and nocow is False
+    if not need_subvol and not need_nocow:
+        return Verdict("対応済み", "")
+    reasons = []
+    if need_subvol:
+        reasons.append("スナップショット対象の中にある")
+    if need_nocow:
+        reasons.append("NOCOW になっていない")
+    if not want_subvolume and need_nocow and in_snapshot:
+        reasons.append("スナップショット対象なので NOCOW の効果は限定的")
+    if preset:
+        cmd = f"btrfs-nocow migrate --preset {preset}"
+    else:
+        opts = []
+        if need_subvol or (want_subvolume and is_subvol):
+            opts.append("--subvolume")
+        if want_nocow:
+            opts.append("--nocow")
+        opts += [f"--nocow-subdir {shlex.quote(s)}" for s in nocow_subdirs]
+        cmd = f"btrfs-nocow migrate {shlex.quote(path)} {' '.join(opts)}".strip()
+    return Verdict("推奨", "・".join(reasons), cmd)
+
+
+def judge_file(*, kind: str, size: int, extents: int | None, age_days: float, nocow: bool | None, in_snapshot: bool) -> Verdict:
+    """大きな DB・VM イメージのファイルを判定する。"""
+    if age_days > 30:
+        return Verdict("不要", "30 日以上書き換えられていない（チェックサムを残す）")
+    if nocow is None:
+        return Verdict("要 root", "属性を読めない")
+    if nocow:
+        if in_snapshot:
+            return Verdict("推奨", "NOCOW だがスナップショット対象（親をサブボリュームに）")
+        return Verdict("対応済み", "")
+    fragmented = extents is not None and extents >= 1000 and extents > size // (1 << 20)
+    if kind == "VM" or fragmented:
+        reason = f"{extents:,} エクステントに断片化" if fragmented and extents is not None else "VM イメージが CoW のまま"
+        return Verdict("推奨", reason)
+    return Verdict("不要", "断片化は小さい")
+
+
+STATUS_STYLE = {"対応済み": "green", "推奨": "bold red", "任意": "yellow", "不要": "dim", "要 root": "magenta", "無し": "dim"}
+
+
+def libvirt_pool_dirs() -> list[str]:
+    """libvirt（qemu:///system）のディレクトリ型プールのパス（virsh が使えなければ空）。"""
+    names = query(["virsh", "-c", "qemu:///system", "pool-list", "--all", "--name"]) or ""
+    dirs: list[str] = []
+    for name in filter(None, (n.strip() for n in names.splitlines())):
+        xml = query(["virsh", "-c", "qemu:///system", "pool-dumpxml", name]) or ""
+        if re.search(r"<pool type=['\"](dir|fs)['\"]", xml):
+            m = re.search(r"<path>(.*?)</path>", xml)
+            if m:
+                dirs.append(m[1])
+    return dirs
+
+
+def swap_files() -> list[str]:
+    """使用中の swap ファイル。"""
+    out: list[str] = []
+    with contextlib.suppress(OSError):
+        for line in Path("/proc/swaps").read_text().splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "file":
+                out.append(_unescape_mountinfo(parts[0]))
+    return out
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    """洗い出しを行い、判定を表にする。"""
+    mounts = read_mounts()
+    configs = read_snapshot_configs()
+    btrfs_mounts = [m for m in mounts if m.fstype == "btrfs"]
+    if not btrfs_mounts:
+        log("btrfs のマウントが無い。対象外", "yellow")
+        return 0
+    if os.geteuid() != 0:
+        log("一般ユーザーで実行している。root しか読めない場所は「要 root」になる（sudo で実行すると網羅できる）", "dim")
+
+    # ---- 1. 構成 ----
+    t = Table(title="btrfs のマウントとスナップショット", title_justify="left")
+    for col in ("マウント先", "サブボリューム", "デバイス", "スナップショット"):
+        t.add_column(col)
+    for m in btrfs_mounts:
+        c = snapshot_config_for(Path(m.mount_point), configs)
+        snap = "—" if not c else f"snapper {c.name}" + {True: "（timeline）", False: "", None: ""}[c.timeline]
+        t.add_row(m.mount_point, m.root, m.source, snap)
+    log.table(t)
+    for tool, path in (("timeshift", "/etc/timeshift/timeshift.json"), ("btrbk", "/etc/btrbk/btrbk.conf")):
+        if Path(path).exists():
+            log(f"{tool} の設定がある（{path}）。このツールが取るスナップショットは上の表に出ないので別途確認する", "yellow")
+
+    # ---- 2. よくある置き場所 ----
+    items: list[Known] = list(KNOWN)
+    known_paths = {str(expand(k.path)) for k in items}
+    for d in libvirt_pool_dirs():
+        if str(expand(d)) not in known_paths:
+            items.append(Known(d, "libvirt のプール", True, nocow_all=True))
+            known_paths.add(str(expand(d)))
+    t = Table(title="よくある置き場所", title_justify="left")
+    for col in ("判定", "場所", "種類", "容量", "サブボリューム", "スナップショット", "NOCOW", "理由・対処"):
+        t.add_column(col, overflow="fold")
+    mps = {m.mount_point for m in mounts}
+    for k in items:
+        p = expand(k.path)
+        exists = os.path.isdir(p)
+        if not exists:
+            if args.all:
+                t.add_row(Text("無し", "dim"), str(p), k.label, "", "", "", "", "")
+            continue
+        m = mount_of(p, mounts)
+        if not m or m.fstype != "btrfs":
+            continue
+        sv = containing_subvolume(p, mounts)
+        cfg = snapshot_config_for(sv, configs)
+        is_sv = is_subvolume_root(p)
+        if k.nocow_subdirs:
+            if not os.access(p, os.X_OK):
+                nocow = None  # 中を見られない
+            else:
+                # 対象のサブディレクトリがまだ無ければ、直すものも無い
+                flags = [get_nocow(p / s) for s in k.nocow_subdirs if os.path.isdir(p / s)]
+                nocow = None if None in flags else all(flags)
+        else:
+            nocow = get_nocow(p)
+        size: str
+        measured: int | None = None  # 判定に使う容量（数え切れたときだけ）
+        if args.no_sizes:
+            size = ""
+        elif not os.access(p, os.R_OK | os.X_OK):
+            size = "要 root"
+        else:
+            s = walk_with_status(p, str(p), mount_points=mps, time_limit=args.size_time_limit)
+            size = ("≥ " if s.truncated else "") + human(s.bytes)
+            measured = None if s.truncated or s.unreadable else s.bytes
+        v = judge_location(
+            path=str(p), exists=True, want_subvolume=k.want_subvolume, want_nocow=k.nocow_all, nocow_subdirs=k.nocow_subdirs,
+            is_subvol=is_sv, in_snapshot=cfg is not None and not is_sv, nocow=nocow, preset=k.preset, size=measured,
+        )
+        sv_text = "○（根）" if is_sv else f"× {sv} の中"
+        nocow_text = {True: "○", False: "×", None: "?"}[nocow] + (f"（{', '.join(k.nocow_subdirs)}）" if k.nocow_subdirs else "")
+        detail = "\n".join(x for x in (v.reason, k.note, v.command) if x)
+        t.add_row(Text(v.status, STATUS_STYLE[v.status]), str(p), k.label, size, sv_text, cfg.name if cfg and not is_sv else "—", nocow_text, detail)
+    log.table(t)
+
+    for sw in swap_files():
+        p = Path(sw)
+        nocow = get_nocow(p)
+        cfg = snapshot_config_for(containing_subvolume(p, mounts), configs)
+        if nocow is False or cfg:
+            log(f"swap ファイル {sw}: NOCOW={nocow} / スナップショット={cfg.name if cfg else 'なし'}。"
+                "btrfs では専用のサブボリュームに `btrfs filesystem mkswapfile` で作る", "red")
+
+    # ---- 3. 大きな DB・VM イメージ ----
+    if args.no_files:
+        return 0
+    roots = [expand(r) for r in args.roots] if args.roots else [p for p in (invoking_user().home, Path("/srv"), Path("/var/lib"), Path("/opt")) if os.path.isdir(p)]
+    found: list[tuple[Path, str, os.stat_result]] = []
+    unreadable = 0
+    other_fs = {m.mount_point for m in mounts if m.fstype != "btrfs"}  # 別のファイルシステムには入らない
+    with log.console.status("大きな DB・VM イメージを探しています…") as status:
+        n = 0
+        for root in roots:
+            stack = [str(root)]
+            while stack:
+                d = stack.pop()
+                try:
+                    it = os.scandir(d)
+                except OSError:
+                    unreadable += 1
+                    continue
+                with it:
+                    for e in it:
+                        n += 1
+                        if n % 5000 == 0:
+                            status.update(f"大きな DB・VM イメージを探しています… {n:,} 件（{d[:80]}）")
+                        try:
+                            if e.is_dir(follow_symlinks=False):
+                                if e.name in SCAN_PRUNE_NAMES or e.path in known_paths or e.path in other_fs or e.name.endswith(OLD_SUFFIX):
+                                    continue
+                                stack.append(e.path)
+                                continue
+                            if not e.is_file(follow_symlinks=False):
+                                continue
+                            suffix = Path(e.name).suffix.lower()
+                            kind = "VM" if suffix in VM_SUFFIXES else "DB" if suffix in DB_SUFFIXES or e.name in DB_NAMES else ""
+                            if not kind:
+                                continue
+                            s = e.stat(follow_symlinks=False)
+                            if s.st_size >= args.min_size:
+                                found.append((Path(e.path), kind, s))
+                        except OSError:
+                            continue
+    t = Table(title=f"大きな DB・VM イメージ（{human(args.min_size)} 以上、探した場所: {', '.join(map(str, roots))}）", title_justify="left")
+    for col in ("判定", "ファイル", "種類", "大きさ", "エクステント", "最終更新", "NOCOW", "スナップショット", "理由・対処"):
+        t.add_column(col, overflow="fold")
+    now = time.time()
+    compressed = any("compress" in m.super_options for m in btrfs_mounts)
+    rows = []
+    for p, kind, s in sorted(found, key=lambda x: -x[2].st_size):
+        cfg = snapshot_config_for(containing_subvolume(p, mounts), configs)
+        nocow = get_nocow(p)
+        ext = extent_count(p)
+        age = (now - s.st_mtime) / 86400
+        v = judge_file(kind=kind, size=s.st_size, extents=ext, age_days=age, nocow=nocow, in_snapshot=cfg is not None)
+        cmd = ""
+        if v.status == "推奨":
+            cmd = f"btrfs-nocow migrate {shlex.quote(str(p.parent))} --nocow" + (" --subvolume" if cfg else "")
+        rows.append((v, p, kind, s, ext, age, nocow, cfg, cmd))
+    order = {"推奨": 0, "要 root": 1, "任意": 2, "対応済み": 3, "不要": 4}
+    hidden = 0 if args.all else sum(1 for r in rows if r[0].status == "不要")
+    if not args.all:
+        rows = [r for r in rows if r[0].status != "不要"]
+    for v, p, kind, s, ext, age, nocow, cfg, cmd in sorted(rows, key=lambda r: order.get(r[0].status, 9)):
+        t.add_row(
+            Text(v.status, STATUS_STYLE[v.status]), str(p), kind, human(s.st_size), "?" if ext is None else f"{ext:,}",
+            f"{age:.0f} 日前" if age >= 1 else "1 日以内", {True: "○", False: "×", None: "?"}[nocow], cfg.name if cfg else "—",
+            "\n".join(x for x in (v.reason, cmd) if x),
+        )
+    log.table(t)
+    if hidden:
+        log(f"「不要」の {hidden:,} 件は省いた（断片化していない・30 日以上書き換えられていない。--all で表示）", "dim")
+    if compressed:
+        log("圧縮を有効にしてマウントしている。圧縮されたファイルは 128KiB ごとに数えられるので、エクステント数が多く見える", "dim")
+    if unreadable:
+        log(f"読めなかったディレクトリ: {unreadable:,} 件（sudo で実行すると網羅できる）", "dim")
+    log("対処は「推奨」の行の migrate コマンドで行う（--dry-run で事前確認できる）。親ディレクトリごと作り直すので、"
+        "同じ場所に他のデータがあればそれも移る点に注意", "dim")
+    return 0
+
+
+# =====================================================================
+# 移行（migrate / rollback / cleanup）
+# =====================================================================
+
+
+@dataclass(frozen=True)
+class TargetSpec:
+    """移行する1か所と、その形。"""
+
+    path: str
+    subvolume: bool
+    nocow_all: bool = False
+    nocow_subdirs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Preset:
+    """よく使う移行の組み合わせ。"""
+
+    description: str
+    targets: tuple[TargetSpec, ...]
+    stop_units: tuple[str, ...] = ()  # 止める順。再開は逆順
+    restore_docker: bool = False  # 移行前に動いていた Docker のコンテナを起動し直す
+    forbid_process_prefixes: tuple[str, ...] = ()  # 停止後に残っていたら中止するプロセス名（comm）の接頭辞
+
+
+PRESETS: dict[str, Preset] = {
+    "docker": Preset(
+        "Docker と containerd のデータをサブボリュームにし、ボリュームだけ NOCOW にする",
+        (TargetSpec("/var/lib/docker", True, nocow_subdirs=("volumes",)), TargetSpec("/var/lib/containerd", True)),
+        ("docker.socket", "docker.service", "containerd.service"),
+        restore_docker=True,
+        forbid_process_prefixes=("containerd-shim",),
+    ),
+    "podman": Preset(
+        "Podman（root）のデータをサブボリュームにし、ボリュームだけ NOCOW にする",
+        (TargetSpec("/var/lib/containers", True, nocow_subdirs=("storage/volumes",)),),
+        ("podman.socket", "podman.service"),
+        forbid_process_prefixes=("conmon",),
+    ),
+    "libvirt": Preset("libvirt の既定プールをサブボリュームにして NOCOW にする（VM は先に止めておく）", (TargetSpec("/var/lib/libvirt/images", True, nocow_all=True),)),
+    "mysql": Preset("MySQL / MariaDB のデータをサブボリュームにして NOCOW にする", (TargetSpec("/var/lib/mysql", True, nocow_all=True),), ("mysql.service", "mariadb.service")),
+    "postgresql": Preset("PostgreSQL のデータをサブボリュームにして NOCOW にする", (TargetSpec("/var/lib/postgresql", True, nocow_all=True),), ("postgresql.service",)),
+    "mongodb": Preset("MongoDB のデータをサブボリュームにして NOCOW にする", (TargetSpec("/var/lib/mongodb", True, nocow_all=True),), ("mongod.service",)),
+}
+
+
+def old_path(path: Path) -> Path:
+    """退避先のパス。"""
+    return path.with_name(path.name + OLD_SUFFIX)
+
+
+# ---- 記録（state.json） ----
+
+
+def default_state_path() -> Path:
+    """移行の記録の置き場所。"""
+    if os.geteuid() == 0:
+        return Path("/var/lib/btrfs-nocow/state.json")
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "btrfs-nocow" / "state.json"
+
+
+class State:
+    """移行の記録。rollback / cleanup が参照する。"""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.data: dict[str, Any] = {"migrations": {}}
+        if path.exists():
+            self.data = json.loads(path.read_text())
+
+    @property
+    def migrations(self) -> dict[str, dict[str, Any]]:
+        """パス → 記録。"""
+        return self.data.setdefault("migrations", {})
+
+    def save(self) -> None:
+        """書き込む（途中で落ちても壊れないよう、別名に書いてから置き換える）。"""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".state-")
+        with os.fdopen(fd, "w") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.path)
+
+
+@contextlib.contextmanager
+def state_lock(state_path: Path) -> Iterator[None]:
+    """同時に2つの移行が走らないようにする。"""
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(state_path.parent / ".lock", "w") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise MigrationError(f"別の btrfs-nocow が実行中（{state_path.parent / '.lock'}）") from None
+        yield
+
+
+# ---- サービスの停止と再開 ----
+
+
+def unit_state(unit: str) -> tuple[bool, bool]:
+    """(存在するか, 動いているか)。"""
+    out = query(["systemctl", "show", "-p", "LoadState", "-p", "ActiveState", unit]) or ""
+    kv = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    return kv.get("LoadState") == "loaded", kv.get("ActiveState") in ("active", "activating", "reloading")
+
+
+def stop_units(units: list[str], stopped: list[str]) -> None:
+    """動いているものを指定の順に止め、止めたものを stopped に足す（途中で失敗しても、そこまでに止めたものが残る）。
+
+    docker.socket のように、止めると他のユニット（docker.service）も一緒に止まるものがある。
+    そのため、動いているかどうかは止め始める前にまとめて調べ、一緒に止まったものも再開の対象に入れる。
+    """
+    active_before: list[str] = []
+    for u in units:
+        exists, active = unit_state(u)
+        if not exists:
+            log(f"{u}: 無いのでスキップ", "dim")
+        elif not active:
+            log(f"{u}: 動いていない", "dim")
+        else:
+            active_before.append(u)
+    for u in active_before:
+        if unit_state(u)[1]:
+            run(["systemctl", "stop", u])
+        else:
+            log(f"{u}: 先に止めたユニットと一緒に止まった", "dim")
+        stopped.append(u)
+    for u in stopped:
+        if unit_state(u)[1]:
+            raise MigrationError(f"{u} が止まらない")
+
+
+def start_units(stopped: list[str]) -> None:
+    """止めたものを逆順に起動する（失敗しても残りは続ける）。"""
+    for u in reversed(stopped):
+        with contextlib.suppress(MigrationError):
+            run(["systemctl", "start", u], check=False)
+        if not unit_state(u)[1]:
+            log(f"{u} が起動していない。`systemctl status {u}` で確認する", "bold red")
+
+
+def docker_running_containers() -> list[str]:
+    """動いている Docker のコンテナ名。"""
+    out = query(["docker", "ps", "--format", "{{.Names}}"])
+    return [n for n in (out or "").splitlines() if n.strip()]
+
+
+def restore_docker_containers(names: list[str]) -> None:
+    """移行前に動いていたコンテナのうち、止まっているものを起動する（再起動ポリシーが no のもの等）。"""
+    if not names or not shutil.which("docker"):
+        return
+    for _ in range(60):
+        if query(["docker", "info", "--format", "{{.ServerVersion}}"]):
+            break
+        time.sleep(1)
+    time.sleep(5)  # 再起動ポリシーで上がるものを待つ
+    running = set(docker_running_containers())
+    for n in names:
+        if n not in running:
+            run(["docker", "start", n], check=False)
+    time.sleep(5)
+    out = query(["docker", "ps", "--format", "{{.Names}}\t{{.Status}}"]) or ""
+    for line in out.splitlines():
+        log.plain(f"    {line}")
+    missing = set(names) - set(docker_running_containers())
+    if missing:
+        log(f"起動していないコンテナ: {', '.join(sorted(missing))}", "bold red")
+
+
+# ---- 開いているプロセスの確認 ----
+
+
+def processes_using(paths: list[Path]) -> list[str]:
+    """paths の下のファイルを開いている（cwd・mmap を含む）プロセス。"""
+    prefixes = [str(p) for p in paths]
+    me = os.getpid()
+    found: list[str] = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit() or int(name) == me:
+            continue
+        base = f"/proc/{name}"
+        try:
+            comm = Path(f"{base}/comm").read_text().strip()
+        except OSError:
+            continue
+        targets: list[str] = []
+        for link in ("cwd", "exe"):
+            with contextlib.suppress(OSError):
+                targets.append(os.readlink(f"{base}/{link}"))
+        with contextlib.suppress(OSError):
+            for fd in os.listdir(f"{base}/fd"):
+                with contextlib.suppress(OSError):
+                    targets.append(os.readlink(f"{base}/fd/{fd}"))
+        with contextlib.suppress(OSError), open(f"{base}/maps") as f:
+            for line in f:
+                parts = line.split(None, 5)
+                if len(parts) == 6:
+                    targets.append(parts[5].strip())
+        for t in targets:
+            t = t.removesuffix(" (deleted)")
+            if any(is_under(t, p) for p in prefixes):
+                found.append(f"PID {name}（{comm}）: {t}")
+                break
+    return found
+
+
+def processes_named(prefixes: tuple[str, ...]) -> list[str]:
+    """名前（comm）が接頭辞に一致するプロセス。"""
+    out: list[str] = []
+    for name in os.listdir("/proc"):
+        if name.isdigit():
+            with contextlib.suppress(OSError):
+                comm = Path(f"/proc/{name}/comm").read_text().strip()
+                if comm.startswith(prefixes):
+                    out.append(f"PID {name}（{comm}）")
+    return out
+
+
+# ---- 1か所の計画 ----
+
+
+@dataclass
+class Plan:
+    """1か所の移行の計画。"""
+
+    path: Path
+    subvolume: bool
+    nocow_all: bool
+    nocow_subdirs: list[str]
+    skip: str = ""  # 空でなければ移行しない理由（対応済み等）
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    stats: TreeStats | None = None
+    nocow_bytes: int = 0  # 実コピーになる容量
+    snapshot: str = ""
+
+    @property
+    def old(self) -> Path:
+        """退避先。"""
+        return old_path(self.path)
+
+    def describe(self) -> str:
+        """操作の要約。"""
+        ops = ["サブボリュームとして作り直す" if self.subvolume else "ディレクトリとして作り直す"]
+        if self.nocow_all:
+            ops.append("全体を NOCOW")
+        if self.nocow_subdirs:
+            ops.append("NOCOW: " + ", ".join(self.nocow_subdirs))
+        return "・".join(ops)
+
+
+def nocow_is_satisfied(path: Path, nocow_all: bool, nocow_subdirs: list[str]) -> bool:
+    """NOCOW にすべき範囲が、中のファイルまで NOCOW になっているか。"""
+    areas = [path] if nocow_all else [path / s for s in nocow_subdirs if os.path.isdir(path / s)]
+    for a in areas:
+        if get_nocow(a) is not True or walk_tree(a, check_nocow=True).not_nocow:
+            return False
+    return True
+
+
+def make_plan(spec: TargetSpec, mounts: list[Mount], configs: list[SnapshotConfig]) -> Plan:
+    """事前確認を行い、計画を作る（何も変更しない）。"""
+    path = expand(spec.path)
+    plan = Plan(path, spec.subvolume, spec.nocow_all, list(spec.nocow_subdirs))
+    if os.path.islink(path):
+        plan.errors.append("シンボリックリンクは対象外（リンク先を指定する）")
+        return plan
+    if not os.path.isdir(path):
+        plan.errors.append("ディレクトリが無い")
+        return plan
+    if not os.access(path, os.R_OK | os.X_OK):
+        plan.errors.append("中を読めない（root で実行する）")
+        return plan
+    m = mount_of(path, mounts)
+    if not m or m.fstype != "btrfs":
+        plan.errors.append("btrfs の上ではない")
+        return plan
+    if m.mount_point == str(path):
+        plan.errors.append("マウントポイントは対象外（既に別にマウントされている。中身だけ移すなら別の方法で）")
+        return plan
+    if old_path(path).exists():
+        plan.errors.append(f"{old_path(path)} が既にある（前回の移行の残りなら cleanup か rollback を先に）")
+    if not spec.subvolume and is_subvolume_root(path):
+        plan.subvolume = True
+        plan.warnings.append("既にサブボリュームなので、サブボリュームのまま作り直す")
+    sv = containing_subvolume(path, mounts)
+    cfg = snapshot_config_for(sv, configs) if not is_subvolume_root(path) else None
+    plan.snapshot = cfg.name if cfg else ""
+    if cfg and not plan.subvolume and (spec.nocow_all or spec.nocow_subdirs):
+        plan.warnings.append(f"snapper「{cfg.name}」の対象の中なので、NOCOW だけでは効果が薄い（--subvolume を推奨）")
+    for s in spec.nocow_subdirs:
+        if not os.path.isdir(path / s):
+            plan.warnings.append(f"{s} が無いので NOCOW にしない（後から作られると CoW になる）")
+    plan.nocow_subdirs = [s for s in spec.nocow_subdirs if os.path.isdir(path / s)]
+    # 望む形（サブボリュームか・NOCOW か）に既になっていれば何もしない
+    subvol_ok = not plan.subvolume or is_subvolume_root(path)
+    nocow_ok = not (plan.nocow_all or plan.nocow_subdirs) or nocow_is_satisfied(path, plan.nocow_all, plan.nocow_subdirs)
+    if subvol_ok and nocow_ok:
+        plan.skip = "対応済み"
+        return plan
+    plan.stats = walk_with_status(path, str(path), mount_points={x.mount_point for x in mounts})
+    if plan.stats.nested_subvolumes:
+        plan.errors.append("入れ子のサブボリュームがある（コピーすると普通のディレクトリになってしまう）: " + ", ".join(plan.stats.nested_subvolumes[:5]))
+    if plan.stats.unreadable:
+        plan.errors.append(f"読めないファイル・ディレクトリが {plan.stats.unreadable} 件ある（root で実行する）")
+    if plan.nocow_all:
+        plan.nocow_bytes = plan.stats.bytes
+    else:
+        plan.nocow_bytes = sum(walk_tree(path / s).bytes for s in plan.nocow_subdirs)
+    vfs = os.statvfs(path)
+    free = vfs.f_bavail * vfs.f_frsize
+    if plan.nocow_bytes > free * 0.9:
+        plan.errors.append(f"空き容量が足りない（実コピー {human(plan.nocow_bytes)} / 空き {human(free)}）")
+    return plan
+
+
+# ---- コピー ----
+
+
+def read_wchar(pid: int) -> int:
+    """プロセスが write 系で書いたバイト数（/proc/<pid>/io）。"""
+    with contextlib.suppress(OSError, ValueError):
+        for line in Path(f"/proc/{pid}/io").read_text().splitlines():
+            if line.startswith("wchar:"):
+                return int(line.split()[1])
+    return 0
+
+
+def run_cp(args: list[str], total: int, label: str, *, reflink: bool) -> None:
+    """cp を実行し、書き込み量でプログレスバーを出す（reflink は容量を書かないので経過時間だけ）。"""
+    log(f"+ {shlex.join(args)}", "yellow")
+    with tempfile.TemporaryFile("w+") as err:
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=err, env=CMD_ENV)
+        columns: list[Any] = [SpinnerColumn(), TextColumn("{task.description}")]
+        if reflink:
+            columns += [TimeElapsedColumn()]
+        else:
+            columns += [BarColumn(), DownloadColumn(binary_units=True), TransferSpeedColumn(), TimeRemainingColumn(), TimeElapsedColumn()]
+        start = last_log = time.monotonic()
+        with Progress(*columns, console=log.console, transient=False) as prog:
+            task = prog.add_task(label, total=None if reflink else max(total, 1))
+            while proc.poll() is None:
+                done = read_wchar(proc.pid)
+                prog.update(task, completed=min(done, total))
+                now = time.monotonic()
+                if now - last_log >= PROGRESS_LOG_INTERVAL and log.file_console:
+                    log.file_console.print(f"    {label}: 経過 {now - start:.0f} 秒 / 書き込み {human(done)} / 全体 {human(total)}", markup=False)
+                    last_log = now
+                time.sleep(0.5)
+            prog.update(task, completed=total)
+        err.seek(0)
+        msg = err.read().strip()
+    if proc.returncode != 0:
+        raise MigrationError(f"cp が失敗した（終了コード {proc.returncode}）: {msg[-2000:]}")
+    log(f"  {label}: 完了（{time.monotonic() - start:.0f} 秒）")
+
+
+def copy_dir_meta(src: Path, dst: Path) -> None:
+    """ディレクトリの所有者・権限・拡張属性（ACL・SELinux 等）を写す。btrfs.* は写さない。"""
+    s = os.lstat(src)
+    with contextlib.suppress(PermissionError):
+        os.chown(dst, s.st_uid, s.st_gid)
+    os.chmod(dst, stat.S_IMODE(s.st_mode))
+    with contextlib.suppress(OSError):
+        for name in os.listxattr(src, follow_symlinks=False):
+            if name.startswith("btrfs."):
+                continue
+            try:
+                os.setxattr(dst, name, os.getxattr(src, name, follow_symlinks=False), follow_symlinks=False)
+            except OSError as e:
+                log(f"  拡張属性 {name} を写せない（{dst}）: {e}", "yellow")
+
+
+def copy_excluding(src: Path, dst: Path, excludes: set[Path], rel: Path = Path()) -> None:
+    """src の中身を dst へ reflink でコピーする。excludes（相対パス）とその下は除く。"""
+    batch: list[str] = []
+    descend: list[str] = []
+    with os.scandir(src / rel) as it:
+        for e in sorted(it, key=lambda x: x.name):
+            r = rel / e.name
+            if r in excludes:
+                continue
+            if any(r in ex.parents for ex in excludes):
+                descend.append(e.name)
+            else:
+                batch.append(e.path)
+    for i in range(0, len(batch), 500):
+        chunk = batch[i : i + 500]
+        run_cp(["cp", "-a", "--reflink=auto", "-t", str(dst / rel), "--", *chunk], 0, f"reflink でコピー: {src / rel}（{len(chunk)} 件）", reflink=True)
+    for name in descend:
+        copy_excluding(src, dst, excludes, rel / name)
+
+
+def create_target(plan: Plan) -> None:
+    """新しいサブボリューム（またはディレクトリ）を作り、NOCOW を付ける。"""
+    if plan.subvolume:
+        run(["btrfs", "subvolume", "create", str(plan.path)])
+    else:
+        log(f"+ mkdir {plan.path}", "yellow")
+        plan.path.mkdir()
+    copy_dir_meta(plan.old, plan.path)
+    if plan.nocow_all:
+        run(["chattr", "+C", str(plan.path)])
+    for s in plan.nocow_subdirs:
+        rel = Path(s)
+        # 途中のディレクトリを作って属性を写し、最後のディレクトリに NOCOW を付ける
+        for part in reversed([*rel.parents][:-1]):
+            d = plan.path / part
+            if not d.exists():
+                d.mkdir()
+                copy_dir_meta(plan.old / part, d)
+        (plan.path / rel).mkdir()
+        copy_dir_meta(plan.old / rel, plan.path / rel)
+        run(["chattr", "+C", str(plan.path / rel)])
+
+
+def restore_dir_times(plan: Plan) -> None:
+    """作ったディレクトリの更新日時を元に合わせる（中にコピーしたことで変わるため）。"""
+    dirs = [Path()]
+    for s in plan.nocow_subdirs:
+        dirs += [*Path(s).parents][:-1] + [Path(s)]
+    for d in dirs:
+        with contextlib.suppress(OSError):
+            s = os.lstat(plan.old / d)
+            os.utime(plan.path / d, ns=(s.st_atime_ns, s.st_mtime_ns), follow_symlinks=False)
+
+
+def verify(plan: Plan, mps: set[str]) -> TreeStats:
+    """コピーの結果を確かめる（数・容量・NOCOW・サブボリューム）。"""
+    a = walk_with_status(plan.old, f"検証（元）{plan.old}", mount_points=mps)
+    b = walk_with_status(plan.path, f"検証（新）{plan.path}", mount_points=mps)
+    log(f"  元: {a.entries:,} 件 / {human(a.bytes)}　新: {b.entries:,} 件 / {human(b.bytes)}")
+    if (a.entries, a.files, a.bytes) != (b.entries, b.files, b.bytes):
+        raise MigrationError(f"コピーの結果が一致しない（元 {a.entries} 件 {a.bytes} B / 新 {b.entries} 件 {b.bytes} B）")
+    if plan.subvolume and not is_subvolume_root(plan.path):
+        raise MigrationError(f"{plan.path} がサブボリュームになっていない")
+    areas = [plan.path] if plan.nocow_all else [plan.path / s for s in plan.nocow_subdirs]
+    for area in areas:
+        c = walk_tree(area, check_nocow=True, mount_points=mps)
+        if get_nocow(area) is not True or c.not_nocow:
+            raise MigrationError(f"{area} に NOCOW でないものが {c.not_nocow} 件ある")
+        log(f"  {area}: NOCOW を確認（{c.files:,} ファイル）", "green")
+    return b
+
+
+def migrate_one(plan: Plan, mps: set[str]) -> None:
+    """1か所を移す: 退避 → 作成 → コピー → 検証。"""
+    log(f"==== {plan.path}: {plan.describe()} ====", "bold cyan")
+    log(f"+ mv {plan.path} {plan.old}", "yellow")
+    os.rename(plan.path, plan.old)
+    create_target(plan)
+    if plan.nocow_all:
+        run_cp(["cp", "-a", "--reflink=never", f"{plan.old}/.", f"{plan.path}/"], plan.nocow_bytes, f"実コピー（NOCOW）: {plan.path}", reflink=False)
+    else:
+        copy_excluding(plan.old, plan.path, {Path(s) for s in plan.nocow_subdirs})
+        for s in plan.nocow_subdirs:
+            total = walk_tree(plan.old / s).bytes
+            run_cp(["cp", "-a", "--reflink=never", f"{plan.old / s}/.", f"{plan.path / s}/"], total, f"実コピー（NOCOW）: {plan.path / s}", reflink=False)
+    restore_dir_times(plan)
+    verify(plan, mps)
+
+
+def remove_tree(path: Path) -> None:
+    """ディレクトリまたはサブボリュームを消す（root でなければ中身を消してから rmdir）。"""
+    if not path.exists() and not path.is_symlink():
+        return
+    if is_subvolume_root(path) and os.geteuid() == 0:
+        run(["btrfs", "subvolume", "delete", str(path)])
+        return
+    with log.console.status(f"削除中: {path}"):
+        run(["rm", "-rf", "--one-file-system", "--", str(path)])
+    if path.exists():  # 一般ユーザーが作ったサブボリュームは中身を消した後に rmdir できる
+        os.rmdir(path)
+
+
+def undo_one(path: Path) -> None:
+    """1か所を元に戻す（新しい側を消し、<パス>.old を戻す）。"""
+    old = old_path(path)
+    if not old.exists():
+        if path.exists():
+            log(f"{path}: 退避する前だったので変更なし", "dim")
+            return
+        raise MigrationError(f"{path} も {old} も無い")
+    if path.exists():
+        remove_tree(path)
+    log(f"+ mv {old} {path}", "yellow")
+    os.rename(old, path)
+
+
+# ---- サブコマンド ----
+
+
+def confirm(args: argparse.Namespace, question: str) -> bool:
+    """確認する（--yes なら聞かない）。"""
+    if args.yes:
+        return True
+    if not sys.stdin.isatty():
+        raise MigrationError("端末からの確認ができない。確認なしで進めるなら --yes を付ける")
+    return Confirm.ask(question, console=log.console, default=False)
+
+
+def specs_from_args(args: argparse.Namespace) -> tuple[list[TargetSpec], Preset | None]:
+    """コマンドラインから移行の対象を決める。"""
+    if args.preset:
+        if args.paths or args.nocow or args.nocow_subdir or args.subvolume:
+            raise MigrationError("--preset と、パス・--subvolume・--nocow・--nocow-subdir は同時に指定できない")
+        preset = PRESETS[args.preset]
+        specs = [t for t in preset.targets if os.path.isdir(expand(t.path))]
+        for t in preset.targets:
+            if t not in specs:
+                log(f"{t.path} が無いのでスキップ", "dim")
+        return specs, preset
+    if not args.paths:
+        raise MigrationError("移すディレクトリか --preset を指定する")
+    if not (args.subvolume or args.nocow or args.nocow_subdir):
+        raise MigrationError("--subvolume・--nocow・--nocow-subdir のどれかを指定する")
+    if args.nocow and args.nocow_subdir:
+        raise MigrationError("--nocow と --nocow-subdir は同時に指定できない")
+    for s in args.nocow_subdir:
+        if os.path.isabs(s) or ".." in Path(s).parts:
+            raise MigrationError(f"--nocow-subdir は対象の中の相対パスで指定する: {s}")
+    specs = [TargetSpec(p, args.subvolume, args.nocow, tuple(args.nocow_subdir)) for p in args.paths]
+    return specs, None
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """移行する。"""
+    specs, preset = specs_from_args(args)
+    if not specs:
+        log("移す対象が無い", "yellow")
+        return 0
+    units = list(preset.stop_units if preset else ()) + list(args.stop)
+    mounts = read_mounts()
+    configs = read_snapshot_configs()
+    plans = [make_plan(s, mounts, configs) for s in specs]
+
+    t = Table(title="移行の計画" + ("（dry-run）" if args.dry_run else ""), title_justify="left")
+    for col in ("対象", "操作", "件数", "容量", "実コピー", "スナップショット", "注意"):
+        t.add_column(col, overflow="fold")
+    for p in plans:
+        notes = [Text(e, "bold red") for e in p.errors] + [Text(w, "yellow") for w in p.warnings]
+        if p.skip:
+            notes.insert(0, Text(p.skip, "green"))
+        t.add_row(
+            str(p.path), p.describe(), f"{p.stats.entries:,}" if p.stats else "", human(p.stats.bytes) if p.stats else "",
+            human(p.nocow_bytes) if p.stats else "", p.snapshot or "—", Text("\n").join(notes),
+        )
+    log.table(t)
+    if units:
+        log(f"止めるサービス（動いているものだけ。終わったら逆順に起動する）: {', '.join(units)}")
+    if any(p.errors for p in plans):
+        log("問題があるので中止する", "bold red")
+        return 1
+    todo = [p for p in plans if not p.skip]
+    if not todo:
+        log("すべて対応済み", "green")
+        return 0
+    if args.dry_run:
+        log("dry-run なので、ここで終わる（何も変更していない）", "green")
+        return 0
+    if not confirm(args, "この内容で移行しますか？（サービスを止めている間は使えなくなります）"):
+        log("中止した")
+        return 1
+
+    state_path = args.state or default_state_path()
+    with state_lock(state_path):
+        state = State(state_path)
+        for p in todo:
+            if str(p.path) in state.migrations:
+                raise MigrationError(f"{p.path} の移行の記録が残っている（cleanup か rollback を先に）")
+        containers = docker_running_containers() if preset and preset.restore_docker else []
+        if containers:
+            log(f"移行前に動いているコンテナ: {', '.join(containers)}")
+        started = time.monotonic()
+        stopped: list[str] = []
+        done: list[Plan] = []
+        try:
+            stop_units(units, stopped)
+            # 止めた後に、まだ使っているものが無いかを確かめる
+            paths = [p.path for p in todo]
+            busy = processes_using(paths)
+            if preset and preset.forbid_process_prefixes:
+                busy += processes_named(preset.forbid_process_prefixes)
+            inner = [m.mount_point for m in read_mounts() if any(is_under(m.mount_point, str(x)) and m.mount_point != str(x) for x in paths)]
+            if busy or inner:
+                for b in busy + [f"マウント: {m}" for m in inner]:
+                    log(f"  使用中: {b}", "red")
+                raise MigrationError("対象を使っているプロセスかマウントがある（止めてからやり直す）")
+            mps = {m.mount_point for m in read_mounts()}
+            for p in todo:
+                state.migrations[str(p.path)] = {
+                    "path": str(p.path), "old": str(p.old), "subvolume": p.subvolume, "nocow_all": p.nocow_all,
+                    "nocow_subdirs": p.nocow_subdirs, "stopped_units": stopped, "docker_containers": containers,
+                    "status": "copying", "started": dt.datetime.now().isoformat(timespec="seconds"), "log": str(log.path or ""),
+                }
+                state.save()
+                done.append(p)
+                migrate_one(p, mps)
+                state.migrations[str(p.path)]["status"] = "done"
+                state.migrations[str(p.path)]["finished"] = dt.datetime.now().isoformat(timespec="seconds")
+                state.save()
+        except (MigrationError, OSError, KeyboardInterrupt) as e:
+            log(f"失敗: {e}", "bold red")
+            if done:
+                log("元に戻します", "bold red")
+                for p in reversed(done):
+                    try:
+                        undo_one(p.path)
+                        state.migrations.pop(str(p.path), None)
+                    except (MigrationError, OSError) as e2:
+                        log(f"{p.path} を戻せなかった: {e2}（手で {p.old} を {p.path} に戻す）", "bold red")
+                state.save()
+            start_units(stopped)
+            restore_docker_containers(containers)
+            return 1
+        start_units(stopped)
+        restore_docker_containers(containers)
+    log(f"完了（停止していた時間: {time.monotonic() - started:.0f} 秒）", "bold green")
+    log(f"動作を確認したら `btrfs-nocow cleanup` で {', '.join(str(p.old) for p in todo)} を削除する（戻すなら `btrfs-nocow rollback`）")
+    log("古いスナップショットが参照している分は、cleanup の後も保持期限が切れるまで容量が戻らない", "dim")
+    return 0
+
+
+def select_records(args: argparse.Namespace, state: State) -> list[dict[str, Any]]:
+    """rollback / cleanup の対象の記録。"""
+    recs = state.migrations
+    if args.paths:
+        sel = []
+        for p in args.paths:
+            key = str(expand(p))
+            if key not in recs:
+                raise MigrationError(f"{key} の移行の記録が無い（{state.path}）")
+            sel.append(recs[key])
+        return sel
+    return list(recs.values())
+
+
+def cmd_rollback(args: argparse.Namespace) -> int:
+    """移行の前に戻す。"""
+    state_path = args.state or default_state_path()
+    with state_lock(state_path):
+        state = State(state_path)
+        recs = select_records(args, state)
+        if not recs:
+            log(f"移行の記録が無い（{state.path}）")
+            return 0
+        for r in recs:
+            log(f"{r['path']} を {r['old']} の内容に戻す（移行の後に書き込まれたデータは失われる）", "yellow")
+        if args.dry_run or not confirm(args, "元に戻しますか？"):
+            return 0
+        units = list(dict.fromkeys(u for r in recs for u in r.get("stopped_units", [])))
+        containers = list(dict.fromkeys(c for r in recs for c in r.get("docker_containers", [])))
+        stopped: list[str] = []
+        try:
+            stop_units(units, stopped)
+            busy = processes_using([Path(r["path"]) for r in recs])
+            if busy:
+                for b in busy:
+                    log(f"  使用中: {b}", "red")
+                raise MigrationError("対象を使っているプロセスがある")
+            for r in recs:
+                undo_one(Path(r["path"]))
+                state.migrations.pop(r["path"], None)
+                state.save()
+        finally:
+            start_units(stopped)
+            restore_docker_containers(containers)
+    log("元に戻した", "bold green")
+    return 0
+
+
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    """退避した <パス>.old を消す。"""
+    state_path = args.state or default_state_path()
+    with state_lock(state_path):
+        state = State(state_path)
+        recs = select_records(args, state)
+        if not recs:
+            log(f"移行の記録が無い（{state.path}）")
+            return 0
+        for r in recs:
+            if r.get("status") != "done":
+                raise MigrationError(f"{r['path']} の移行が完了していない（status={r.get('status')}）。rollback する")
+            if r.get("subvolume") and not is_subvolume_root(Path(r["path"])):
+                raise MigrationError(f"{r['path']} がサブボリュームになっていない")
+            log(f"削除する: {r['old']}")
+        if args.dry_run or not confirm(args, "削除しますか？（元には戻せなくなります）"):
+            return 0
+        for r in recs:
+            remove_tree(Path(r["old"]))
+            state.migrations.pop(r["path"], None)
+            state.save()
+    log("削除した（古いスナップショットが参照している分は、保持期限が切れるまで容量が戻らない）", "bold green")
+    return 0
+
+
+# =====================================================================
+# 入口
+# =====================================================================
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """コマンドラインの定義。"""
+    presets = "\n".join(f"  {k:<11} {v.description}" for k, v in PRESETS.items())
+    p = argparse.ArgumentParser(
+        prog="btrfs-nocow",
+        description="btrfs で CoW を切るべき場所を洗い出し、サブボリューム化・NOCOW 化して移し替える。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"プリセット（migrate --preset）:\n{presets}\n\n例:\n"
+        "  btrfs-nocow scan\n"
+        "  btrfs-nocow migrate --preset docker --dry-run\n"
+        "  btrfs-nocow migrate ~/.atuin/data --nocow --no-sudo   # 自分のディレクトリ（書き込むプロセスは先に止める）\n"
+        "  btrfs-nocow migrate /srv/vm --subvolume --nocow\n"
+        "  btrfs-nocow cleanup",
+    )
+    p.add_argument("--log", type=Path, help="ログファイル（既定: ~/logs/btrfs-nocow/<日時>-<サブコマンド>.log）")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("scan", help="洗い出しを行い、判定を表にする（root なしでも動く）")
+    s.add_argument("--roots", nargs="+", metavar="DIR", help="大きな DB・VM イメージを探す場所（既定: ホーム・/srv・/var/lib・/opt）")
+    s.add_argument("--min-size", type=parse_size, default=parse_size("32M"), help="探すファイルの最小の大きさ（既定: 32M）")
+    s.add_argument("--no-files", action="store_true", help="大きな DB・VM イメージを探さない")
+    s.add_argument("--no-sizes", action="store_true", help="よくある置き場所の容量を数えない")
+    s.add_argument("--size-time-limit", type=float, default=10.0, help="容量を数える時間の上限 [秒]（超えたら「≥」付きで出す）")
+    s.add_argument("--all", action="store_true", help="無い置き場所や「不要」と判定したファイルも表に出す")
+    s.add_argument("--sudo", action="store_true", help="sudo で起動し直して、root しか読めない場所も調べる")
+
+    for name, help_text in (("migrate", "ディレクトリを作り直して移す"), ("rollback", "migrate の前に戻す"), ("cleanup", "退避した <パス>.old を削除する")):
+        c = sub.add_parser(name, help=help_text, formatter_class=argparse.RawDescriptionHelpFormatter)
+        c.add_argument("paths", nargs="*", metavar="PATH", help="対象のディレクトリ" + ("" if name == "migrate" else "（省略時は記録にあるすべて）"))
+        c.add_argument("--dry-run", action="store_true", help="確認だけ行い、何も変更しない")
+        c.add_argument("-y", "--yes", action="store_true", help="確認を求めない")
+        c.add_argument("--no-sudo", action="store_true", help="sudo で起動し直さない（自分のディレクトリを一般ユーザーのまま扱う）")
+        c.add_argument("--state", type=Path, help="移行の記録のファイル（既定: root なら /var/lib/btrfs-nocow/state.json）")
+        if name == "migrate":
+            c.add_argument("--preset", choices=sorted(PRESETS), help="よく使う組み合わせ（下のプリセットの一覧を参照）")
+            c.add_argument("--subvolume", action="store_true", help="サブボリュームとして作り直す（スナップショットから外す）")
+            c.add_argument("--nocow", action="store_true", help="全体を NOCOW にする")
+            c.add_argument("--nocow-subdir", action="append", default=[], metavar="REL", help="このサブディレクトリだけ NOCOW にする（複数可）")
+            c.add_argument("--stop", action="append", default=[], metavar="UNIT", help="移行の間止める systemd のユニット（複数可、指定順に止める）")
+            c.epilog = f"プリセット:\n{presets}"
+    return p
+
+
+def default_log_path(command: str) -> Path:
+    """既定のログファイル。"""
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return invoking_user().home / "logs" / "btrfs-nocow" / f"{stamp}-{command}.log"
+
+
+def reexec_with_sudo(argv: list[str]) -> None:
+    """同じ Python（rich が入った環境）のまま、sudo で自分を起動し直す。"""
+    script = os.path.abspath(__file__)
+    cmd = ["sudo", sys.executable, "-B", script, *argv]
+    Console(stderr=True).print(f"[dim]root で実行するため sudo で起動し直します: {shlex.join(['sudo', 'btrfs-nocow', *argv])}[/]")
+    os.execvp("sudo", cmd)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """入口。"""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(argv)
+    if os.geteuid() != 0:
+        if args.command == "scan" and args.sudo:
+            reexec_with_sudo(argv)
+        if args.command in ("migrate", "rollback", "cleanup") and not args.no_sudo:
+            reexec_with_sudo(argv)
+    log.open(args.log or default_log_path(args.command))
+    log(f"btrfs-nocow {shlex.join(argv)}（ログ: {log.path}。`tail -f` で経過を追える）", "dim")
+    try:
+        return {"scan": cmd_scan, "migrate": cmd_migrate, "rollback": cmd_rollback, "cleanup": cmd_cleanup}[args.command](args)
+    except MigrationError as e:
+        log(f"エラー: {e}", "bold red")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
