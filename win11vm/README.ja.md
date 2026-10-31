@@ -31,6 +31,7 @@ Windows 11 評価版（Enterprise、90日）の検証用仮想マシンを libvi
 ./win11vm run-gui C:/work/myproj/app.exe           # ログオン中の画面で起動する
 ./win11vm run-gui --hidden powershell.exe -File C:/work/myproj/check.ps1   # ウィンドウを出さずに動かす
 ./win11vm key KEY_VOLUMEUP                         # キーを送る（Linux のキー名）
+./win11vm click 500 350                            # 画面の座標（ピクセル）をクリックする
 ./win11vm shot after-volume-up                     # 画面を PNG で保存する
 ./win11vm ps 'Get-Process app'                     # PowerShell を実行する
 ./win11vm pull C:/work/myproj/result.txt .         # ファイルを取り出す
@@ -111,5 +112,7 @@ qemu がホームディレクトリを読めなくても動くように、ISO �
 - **sftp（scp）のプログラムは絶対パスで指定する**: MSI で Server の機能だけを入れると、インストール先が PATH に入らず、既定の `Subsystem sftp sftp-server.exe` では見つからない（scp が `Connection closed` で失敗する）。
 - **SSH の既定のシェルは変えない**: PowerShell にすると、sftp のプログラムも PowerShell 経由で起動され、引用符付きのパスが文字列として出力されて転送が壊れる（`Ensure the remote shell produces no output` で失敗する）。PowerShell は `ps` で明示して呼ぶ。
 - **画面に出るプログラムの起動**: SSH のセッションは画面の無いセッションで動くので、`run-gui` はタスク スケジューラーに「ログオン中のユーザー」として登録して起動する。コンソールのプログラムは Windows Terminal のウィンドウで開き、`-WindowStyle Hidden` も効かないので、`--hidden` では `conhost.exe --headless` を前に付ける。
+- **タスクは同時に複数動かせる設定にする**: 既定（`IgnoreNew`）のままだと、前に起動したもの（メモ帳など）が動いている間の起動は `0x800710E0`（要求が拒否された）で黙って失敗する。`run-gui` は `-MultipleInstances Parallel` で登録し、起動できたかをタスクの結果で確かめる。
+- **マウスの操作**: `click`・`move` は、libvirt 経由で QEMU に入力のイベント（QMP の `input-send-event`）を送る。マウスは USB タブレットなので、画面のピクセルを 0〜32767 の絶対座標に換算して送れる。`qemu-monitor-command` を使うので、libvirt は仮想マシンに「独自のモニター操作をした」という印（taint）を付けるが、動作には影響しない。
 - **初期状態**: `save-clean` は ISO を外して消し、ディスクを `<名前>-clean.qcow2` に複製する。`reset` はそれで上書きする（16GB で約10秒）。デバイスの暗号化（BitLocker）は自動で有効にならないようにしてあるので、TPM の状態はそのままでよい。
 - **停止**: `stop` は ACPI でシャットダウンし、「shut off」になるまで待つ（途中の「in shutdown」では `reset` できない）。

@@ -63,6 +63,9 @@ Windows 11 評価版の検証用仮想マシン「$VM_NAME」を作る・操作�
   status              状態と IP アドレスを表示する
   shot [名前]         画面を PNG で保存し、パスを表示する（$SHOT_DIR）
   key <キー>...       キーを同時押しで送る（Linux のキー名。例: KEY_VOLUMEUP、KEY_LEFTMETA KEY_D）
+  click <x> <y> [left|right|middle]
+                      画面の座標（ピクセル）をクリックする
+  move <x> <y>        マウスを動かす（クリックしない。ホバーの確認用）
   ip                  IPv4 アドレスを表示する
   ssh [コマンド]      SSH で入る（既定のシェルは cmd.exe。PowerShell は ps を使う）
   ps <スクリプト>     PowerShell のスクリプトを実行する（引用符を気にせず渡せる。- なら標準入力から読む）
@@ -387,6 +390,53 @@ cmd_key() {
     virsh send-key "$VM_NAME" --codeset linux "$@" >/dev/null
 }
 
+# 画面の大きさ（ピクセル）を、画面の撮影の先頭（PPM か PNG のヘッダー）から読む
+screen_size() {
+    local tmp
+    tmp=$(mktemp)
+    virsh screenshot "$VM_NAME" "$tmp" >/dev/null
+    python3 -I -c '
+import struct, sys
+head = open(sys.argv[1], "rb").read(64)
+if head.startswith(b"\x89PNG"):
+    print(*struct.unpack(">II", head[16:24]))
+else:
+    tokens = head.split()
+    print(int(tokens[1]), int(tokens[2]))
+' "$tmp"
+    rm -f "$tmp"
+}
+
+# QEMU に入力のイベントを送る（libvirt 経由の QMP。マウスは USB タブレットなので絶対座標で送れる）
+qmp_input() {
+    virsh qemu-monitor-command "$VM_NAME" \
+        "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[$1]}}" >/dev/null
+}
+
+# 画面のピクセルの座標を、QEMU の絶対座標（0〜32767）に換算してマウスを動かす
+move_pointer() {
+    local x=$1 y=$2 w h
+    read -r w h < <(screen_size)
+    (( x >= 0 && x < w && y >= 0 && y < h )) || die "座標が画面（${w}×${h}）の外です: $x $y"
+    qmp_input "{\"type\":\"abs\",\"data\":{\"axis\":\"x\",\"value\":$((x * 32767 / (w - 1)))}},{\"type\":\"abs\",\"data\":{\"axis\":\"y\",\"value\":$((y * 32767 / (h - 1)))}}"
+}
+
+cmd_move() {
+    [[ $# -eq 2 ]] || die "使い方: move <x> <y>（画面のピクセルで指定）"
+    move_pointer "$1" "$2"
+}
+
+cmd_click() {
+    [[ $# -ge 2 ]] || die "使い方: click <x> <y> [left|right|middle]（画面のピクセルで指定）"
+    local button=${3:-left}
+    [[ $button =~ ^(left|right|middle)$ ]] || die "ボタンは left・right・middle のどれかです: $button"
+    move_pointer "$1" "$2"
+    sleep 0.1
+    qmp_input "{\"type\":\"btn\",\"data\":{\"down\":true,\"button\":\"$button\"}}"
+    sleep 0.05
+    qmp_input "{\"type\":\"btn\",\"data\":{\"down\":false,\"button\":\"$button\"}}"
+}
+
 require_ip() {
     local ip
     ip=$(cmd_ip)
@@ -462,9 +512,19 @@ cmd_run_gui() {
 \$ErrorActionPreference = 'Stop'
 \$action = $action
 \$principal = New-ScheduledTaskPrincipal -UserId \$env:USERNAME -LogonType Interactive -RunLevel $level
-\$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+# 前に起動したもの（メモ帳など）が動いている間も起動できるよう、同時に複数動かせる設定にする。
+# 既定（IgnoreNew）のままだと、動いている間の起動は 0x800710E0（要求が拒否された）で黙って失敗する
+\$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances Parallel
 Register-ScheduledTask -TaskName 'win11vm-run-gui' -Action \$action -Principal \$principal -Settings \$settings -Force | Out-Null
+\$before = (Get-ScheduledTaskInfo -TaskName 'win11vm-run-gui').LastRunTime
 Start-ScheduledTask -TaskName 'win11vm-run-gui'
+# 起動できたかを確かめる（0: 終了済み、0x41301: 実行中。それ以外は起動の失敗）
+Start-Sleep -Milliseconds 1500
+\$info = Get-ScheduledTaskInfo -TaskName 'win11vm-run-gui'
+if (\$info.LastRunTime -eq \$before -or (\$info.LastTaskResult -ne 0 -and \$info.LastTaskResult -ne 0x41301)) {
+    Write-Output ('起動に失敗しました: ' + $(ps_quote "$exe") + ('（タスクの結果: 0x{0:X}）' -f \$info.LastTaskResult))
+    exit 1
+}
 Write-Output ('起動しました: ' + $(ps_quote "$exe"))
 "
 }
@@ -545,6 +605,8 @@ main() {
         status) cmd_status "$@" ;;
         shot) cmd_shot "$@" ;;
         key) cmd_key "$@" ;;
+        click) cmd_click "$@" ;;
+        move) cmd_move "$@" ;;
         ip) cmd_ip "$@" ;;
         ssh) cmd_ssh "$@" ;;
         ps) cmd_ps "$@" ;;
