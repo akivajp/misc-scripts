@@ -1,0 +1,564 @@
+#!/usr/bin/env bash
+# win11vm — Windows 11 評価版の検証用仮想マシン（libvirt / KVM）を作る・操作する
+#
+# スクリプトはどこに置いても動く。状態（ISO・鍵・パスワード・ログ・画面の撮影結果）は
+# WIN11VM_HOME（既定: ~/vms/win11-eval）に置き、git には入れない。
+# ディスクと ISO の実体は libvirt のプール（既定: default = /var/lib/libvirt/images）に置く。
+set -euo pipefail
+
+# virsh などの出力を、言語の設定によらず同じ形で読むため
+export LC_ALL=C.UTF-8
+
+# ===== 設定（環境変数で上書きできる） =====
+VM_NAME="${WIN11VM_NAME:-win11-eval}"                  # libvirt のドメイン名
+STATE_DIR="${WIN11VM_HOME:-$HOME/vms/win11-eval}"       # 状態の置き場所
+export LIBVIRT_DEFAULT_URI="${WIN11VM_URI:-qemu:///system}"
+# ディスクと ISO を置く libvirt のプールと、プールが無いときに作る場所。
+# btrfs では、ディスクイメージに CoW が効くと遅くなるので、CoW を切ったプールにする。
+# また、スナップショットの対象の subvolume（例: snapper の / や /home）に置くと、
+# スナップショットのたびに書き込みがコピーされて膨らむので、対象外の場所（ここでは /srv）に置く
+POOL="${WIN11VM_POOL:-vm-images}"
+POOL_DIR="${WIN11VM_POOL_DIR:-/srv/libvirt/images}"
+MEMORY_MB="${WIN11VM_MEMORY_MB:-8192}"
+VCPUS="${WIN11VM_VCPUS:-4}"
+DISK_GB="${WIN11VM_DISK_GB:-80}"
+COMPUTER_NAME="${WIN11VM_COMPUTER_NAME:-WIN11-EVAL}"    # 15 文字以内
+
+# 評価版の ISO（Windows 11 Enterprise 26H2、日本語、x64）
+#   配布ページ: https://www.microsoft.com/ja-jp/evalcenter/download-windows-11-enterprise
+#   SHA-256:    https://aka.ms/VerifyWindowsISO （2026-11-01 に確認）
+# 新しい版に差し替わったら、ISO_URL・ISO_FILE・ISO_SHA256 をまとめて更新する
+ISO_URL="https://go.microsoft.com/fwlink/?LinkId=2382604&clcid=0x411&culture=ja-jp&country=jp"
+ISO_FILE="$STATE_DIR/iso/Win11_26H2_EnterpriseEval_ja-jp.iso"
+ISO_SHA256="8fb2cc19c8aee87a688c1cb73e726816c01f0c6ee9a17bb2fb73e4533837e698"
+
+# SSH サーバー（Win32-OpenSSH、Microsoft の公式配布）。設定用の ISO に同梱し、ゲストからインターネットに出ずに導入する
+OPENSSH_URL="https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.4.0.0p1-Preview/OpenSSH-Win64-v10.4.0.0.msi"
+OPENSSH_FILE="$STATE_DIR/cache/OpenSSH-Win64-v10.4.0.0.msi"
+OPENSSH_SHA256="788d8643464a01eb63640a2fd746f9ed23d106b5a901a35f88dc8cd40e446ac9"
+
+TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SECRETS_ENV="$STATE_DIR/secrets/vm.env"
+SSH_KEY="$STATE_DIR/secrets/id_ed25519"
+KNOWN_HOSTS="$STATE_DIR/secrets/known_hosts"
+UNATTEND_ISO="$STATE_DIR/cache/unattend.iso"
+LOCK_FILE="$STATE_DIR/in-use"                           # 使用中の印（1行目: プロジェクト名、2行目: 開始時刻）
+LOG_DIR="$STATE_DIR/logs"
+SHOT_DIR="$STATE_DIR/shots"
+
+usage() {
+    cat <<EOF
+使い方: $(basename "$0") <サブコマンド> [引数]
+
+Windows 11 評価版の検証用仮想マシン「$VM_NAME」を作る・操作する。
+
+作成:
+  download            評価版の ISO と SSH サーバーの MSI を取得し、SHA-256 を照合する（途中から再開できる）
+  build-unattend      無人インストールの設定用 ISO を作る
+  create              仮想マシンを作り、インストールを始める（CD から起動するためのキーも送る）
+  destroy --yes       仮想マシンと、そのディスク・TPM・NVRAM を消す
+
+操作:
+  start | stop | kill 起動 / シャットダウン（最大 120 秒待つ） / 強制停止
+  status              状態と IP アドレスを表示する
+  shot [名前]         画面を PNG で保存し、パスを表示する（$SHOT_DIR）
+  key <キー>...       キーを同時押しで送る（Linux のキー名。例: KEY_VOLUMEUP、KEY_LEFTMETA KEY_D）
+  ip                  IPv4 アドレスを表示する
+  ssh [コマンド]      SSH で入る（既定のシェルは cmd.exe。PowerShell は ps を使う）
+  ps <スクリプト>     PowerShell のスクリプトを実行する（引用符を気にせず渡せる。- なら標準入力から読む）
+  run-gui [--elevated] [--hidden] <プログラム> [引数]
+                      ログオン中の画面でプログラムを起動する（既定は管理者権限なし）。
+                      --hidden はコンソールのウィンドウを出さない（調査用のスクリプトなど）
+  push <ローカル>... <ゲスト>  ファイルをゲストへ送る（例: push build/app.exe C:/work/myproj）
+  pull <ゲスト> <ローカル>     ゲストからファイルを取り出す
+
+初期状態（複数のプロジェクトで使い回すため）:
+  save-clean          今のディスクを初期状態として保存する（停止中のみ）
+  reset               ディスクを初期状態に戻す（停止中のみ）。プロジェクトの作業が済んだら戻す
+  use <プロジェクト名>  使用中の印を付ける（ほかの作業が使用中なら止まる）
+  release             使用中の印を外す
+  license             評価版の残り日数を表示する
+
+環境変数: WIN11VM_NAME, WIN11VM_HOME, WIN11VM_URI, WIN11VM_POOL, WIN11VM_POOL_DIR,
+          WIN11VM_MEMORY_MB, WIN11VM_VCPUS, WIN11VM_DISK_GB, WIN11VM_COMPUTER_NAME
+状態の置き場所: $STATE_DIR
+EOF
+}
+
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+die() { log "エラー: $*" >&2; exit 1; }
+
+# 時間のかかるサブコマンドの出力を、画面とログファイルの両方に出す
+start_log() {
+    mkdir -p "$LOG_DIR"
+    local file
+    file="$LOG_DIR/$1-$(date +%Y%m%d-%H%M%S).log"
+    exec > >(tee -a "$file") 2>&1
+    log "ログ: $file"
+}
+
+# パスワードと SSH の鍵が無ければ作る（どちらも git に入れない）
+ensure_secrets() {
+    mkdir -p "$STATE_DIR/secrets"
+    chmod 700 "$STATE_DIR/secrets"
+    if [[ ! -f $SSH_KEY ]]; then
+        ssh-keygen -q -t ed25519 -N "" -C "win11vm@$(hostname)" -f "$SSH_KEY"
+    fi
+    if [[ ! -f $SECRETS_ENV ]]; then
+        # XML にそのまま埋め込めるよう、英数字だけで作る
+        (umask 077 && printf 'VM_USER=tester\nVM_PASSWORD=%s\n' \
+            "$(python3 -I -c 'import secrets, string; a = string.ascii_letters + string.digits; print("Fl" + "".join(secrets.choice(a) for _ in range(18)) + "9")')" \
+            > "$SECRETS_ENV")
+    fi
+}
+
+load_secrets() {
+    ensure_secrets
+    # shellcheck source=/dev/null
+    source "$SECRETS_ENV"
+    [[ ${VM_USER:-} =~ ^[A-Za-z0-9]+$ ]] || die "VM_USER は英数字だけにしてください: $SECRETS_ENV"
+    [[ ${VM_PASSWORD:-} =~ ^[A-Za-z0-9]+$ ]] || die "VM_PASSWORD は英数字だけにしてください（XML に埋め込むため）: $SECRETS_ENV"
+}
+
+verify_sha256() {
+    local file=$1 expected=$2 actual
+    log "SHA-256 を照合しています: $(basename "$file")"
+    actual=$(sha256sum "$file" | cut -d' ' -f1)
+    [[ ${actual,,} == "${expected,,}" ]] || die "SHA-256 が一致しません: $file（期待: $expected、実際: $actual）"
+    log "SHA-256 が一致しました: $(basename "$file")"
+}
+
+vm_exists() { virsh dominfo "$VM_NAME" >/dev/null 2>&1; }
+vm_state() {
+    # 存在しない仮想マシンでも virsh は空行を出力するので、終了コードで判定して余分な改行を除く
+    local state
+    if state=$(virsh domstate "$VM_NAME" 2>/dev/null); then
+        echo "${state//$'\n'/}"
+    else
+        echo "未作成"
+    fi
+}
+
+cmd_download() {
+    start_log download
+    mkdir -p "$(dirname "$ISO_FILE")" "$(dirname "$OPENSSH_FILE")"
+    if [[ ! -f $OPENSSH_FILE ]]; then
+        curl -fL --retry 5 -o "$OPENSSH_FILE" "$OPENSSH_URL"
+    fi
+    verify_sha256 "$OPENSSH_FILE" "$OPENSSH_SHA256"
+    # 取得済みで SHA-256 が合えば、取り直さない
+    if [[ -f $ISO_FILE ]] && [[ $(stat -c %s "$ISO_FILE") -gt 0 ]]; then
+        if [[ $(sha256sum "$ISO_FILE" | cut -d' ' -f1) == "${ISO_SHA256,,}" ]]; then
+            log "ISO は取得済みです: $ISO_FILE"
+            return 0
+        fi
+    fi
+    # ISO は約 8GB。途中で切れても続きから再開する
+    log "ISO を取得しています（経過は tail -f でこのログを見る）"
+    curl -fL --retry 5 --retry-all-errors --retry-delay 10 -C - \
+        -A "Mozilla/5.0 (X11; Linux x86_64)" -o "$ISO_FILE" "$ISO_URL"
+    verify_sha256 "$ISO_FILE" "$ISO_SHA256"
+}
+
+build_unattend() {
+    load_secrets
+    [[ -f $OPENSSH_FILE ]] || die "SSH サーバーの MSI がありません。先に download を実行してください"
+    local staging
+    staging=$(mktemp -d)
+    mkdir -p "$staging/setup"
+    sed -e "s/@VM_USER@/$VM_USER/g" \
+        -e "s/@VM_PASSWORD@/$VM_PASSWORD/g" \
+        -e "s/@COMPUTER_NAME@/$COMPUTER_NAME/g" \
+        "$TOOL_DIR/unattend/autounattend.xml.in" > "$staging/autounattend.xml"
+    # Windows PowerShell 5.1 は BOM の無いファイルを既定のコードページ（日本語版では CP932）で読み、
+    # 日本語のコメントで構文が壊れるので、UTF-8 の BOM を付けて入れる
+    local f
+    for f in "$TOOL_DIR"/unattend/setup/*.ps1; do
+        { printf '\xef\xbb\xbf'; cat "$f"; } > "$staging/setup/$(basename "$f")"
+    done
+    cp "$OPENSSH_FILE" "$staging/setup/OpenSSH-Win64.msi"
+    cp "$SSH_KEY.pub" "$staging/setup/authorized_keys"
+    mkdir -p "$(dirname "$UNATTEND_ISO")"
+    rm -f "$UNATTEND_ISO"
+    # パスワードを含むので、自分だけが読める権限で作る
+    (umask 077 && xorriso -as mkisofs -quiet -J -joliet-long -r -V WIN11VM_SETUP -o "$UNATTEND_ISO" "$staging")
+    rm -rf "$staging"
+    log "設定用の ISO を作りました: $UNATTEND_ISO"
+}
+
+cmd_build_unattend() {
+    start_log build-unattend
+    build_unattend
+}
+
+# libvirt のプールが無ければ作る（libvirt グループに入っていれば sudo は要らない）。
+# <cow state='no'/> を付けて pool-build すると、root で動く libvirt がディレクトリを作り、
+# btrfs なら CoW を切る（chattr +C 相当。中に作るファイルにも引き継がれる）
+ensure_pool() {
+    if ! virsh pool-list --all --name | grep -qx "$POOL"; then
+        log "プール $POOL を作ります（CoW なし）: $POOL_DIR"
+        local xml
+        xml=$(mktemp)
+        cat > "$xml" <<EOF
+<pool type='dir'>
+  <name>$POOL</name>
+  <features>
+    <cow state='no'/>
+  </features>
+  <target>
+    <path>$POOL_DIR</path>
+    <permissions>
+      <mode>0755</mode>
+      <owner>0</owner>
+      <group>0</group>
+    </permissions>
+  </target>
+</pool>
+EOF
+        virsh pool-define "$xml" >/dev/null
+        rm -f "$xml"
+        virsh pool-build "$POOL" >/dev/null
+        virsh pool-autostart "$POOL" >/dev/null
+    fi
+    if ! virsh pool-list --name | grep -qx "$POOL"; then
+        virsh pool-start "$POOL" >/dev/null
+    fi
+}
+
+# ローカルのファイルを、プールのボリュームとしてアップロードする（qemu がホームディレクトリを読めなくてよいように）
+upload_volume() {
+    local src=$1 vol=$2 size
+    size=$(stat -c %s "$src")
+    if virsh vol-info --pool "$POOL" "$vol" >/dev/null 2>&1; then
+        virsh vol-delete --pool "$POOL" "$vol" >/dev/null
+    fi
+    log "アップロードしています: $(basename "$src") → $POOL/$vol（$((size / 1024 / 1024)) MiB）"
+    virsh vol-create-as "$POOL" "$vol" "$size" --format raw >/dev/null
+    virsh vol-upload --pool "$POOL" "$vol" "$src"
+}
+
+# UEFI で Windows の ISO から起動すると「Press any key to boot from CD or DVD」が数秒だけ出るので、その間キーを送り続ける。
+# 2回目以降の起動はディスクが先に起動するので、この表示は出ない。
+# 送るのは下矢印キーにする。スペースや Enter だと、送り続けている間にセットアップの画面が出たとき、
+# フォーカスのある「キャンセル」ボタンを押してしまう。矢印キーでも CD から起動できることは確認済み
+press_boot_keys() {
+    log "CD から起動するためのキーを送っています（約 20 秒）"
+    local i
+    for i in $(seq 1 40); do
+        virsh send-key "$VM_NAME" --codeset linux KEY_DOWN >/dev/null 2>&1 || true
+        sleep 0.5
+    done
+}
+
+cmd_create() {
+    start_log create
+    load_secrets
+    vm_exists && die "仮想マシン $VM_NAME は既にあります。作り直すときは destroy --yes の後に create を実行してください"
+    [[ -f $ISO_FILE ]] || die "ISO がありません。先に download を実行してください"
+    # 設定やスクリプトを直した後でも古い内容を使わないよう、設定用の ISO は毎回作り直す
+    build_unattend
+    ensure_pool
+    upload_volume "$ISO_FILE" "$VM_NAME-install.iso"
+    upload_volume "$UNATTEND_ISO" "$VM_NAME-unattend.iso"
+    if ! virsh vol-info --pool "$POOL" "$VM_NAME.qcow2" >/dev/null 2>&1; then
+        virsh vol-create-as "$POOL" "$VM_NAME.qcow2" "${DISK_GB}G" --format qcow2 >/dev/null
+    fi
+    log "仮想マシンを作ります: メモリ ${MEMORY_MB}MB、CPU ${VCPUS}、ディスク ${DISK_GB}GB"
+    # ディスクを先、ISO を後にする。空のディスクは起動できないので初回だけ ISO から起動し、
+    # インストール後はディスクから起動する（ISO の「キーを押して」が二度と出ない）
+    virt-install \
+        --name "$VM_NAME" \
+        --osinfo win11 \
+        --memory "$MEMORY_MB" \
+        --vcpus "$VCPUS" \
+        --cpu host-passthrough \
+        --machine q35 \
+        --boot firmware=efi,firmware.feature0.name=secure-boot,firmware.feature0.enabled=yes,firmware.feature1.name=enrolled-keys,firmware.feature1.enabled=yes \
+        --tpm backend.type=emulator,backend.version=2.0,model=tpm-crb \
+        --disk "vol=$POOL/$VM_NAME.qcow2,bus=sata,boot.order=1" \
+        --disk "vol=$POOL/$VM_NAME-install.iso,device=cdrom,bus=sata,boot.order=2" \
+        --disk "vol=$POOL/$VM_NAME-unattend.iso,device=cdrom,bus=sata" \
+        --network network=default,model=e1000e \
+        --sound ich9 \
+        --video vga \
+        --graphics vnc,listen=127.0.0.1 \
+        --input tablet,bus=usb \
+        --import \
+        --noautoconsole
+    press_boot_keys
+    log "インストールを始めました。画面は '$(basename "$0") shot' で撮れる。SSH が通れば完了（20〜40 分の見込み）"
+}
+
+cmd_destroy() {
+    [[ ${1:-} == "--yes" ]] || die "消すときは destroy --yes と指定してください（ディスク・TPM・NVRAM も消えます）"
+    start_log destroy
+    vm_exists || die "仮想マシン $VM_NAME はありません"
+    if [[ $(vm_state) == "running" ]]; then
+        virsh destroy "$VM_NAME" >/dev/null
+    fi
+    virsh undefine "$VM_NAME" --nvram --tpm --remove-all-storage
+    # 初期状態のディスクは仮想マシンにつながっていないので、別に消す
+    if virsh vol-info --pool "$POOL" "$VM_NAME-clean.qcow2" >/dev/null 2>&1; then
+        virsh vol-delete --pool "$POOL" "$VM_NAME-clean.qcow2" >/dev/null
+    fi
+    rm -f "$KNOWN_HOSTS"
+    log "消しました: $VM_NAME"
+}
+
+cmd_start() { virsh start "$VM_NAME"; }
+cmd_kill() { virsh destroy "$VM_NAME"; }
+
+cmd_stop() {
+    virsh shutdown "$VM_NAME" >/dev/null
+    local i
+    # 「running」でなくなっても「in shutdown」の途中のことがあるので、「shut off」になるまで待つ
+    for i in $(seq 1 120); do
+        if [[ $(vm_state) == "shut off" ]]; then
+            log "停止しました"
+            return 0
+        fi
+        sleep 1
+    done
+    die "120 秒待っても止まりません。強制停止するときは kill を実行してください"
+}
+
+cmd_ip() {
+    virsh domifaddr "$VM_NAME" --source lease 2>/dev/null | awk '$3 == "ipv4" { split($4, a, "/"); print a[1]; exit }'
+}
+
+cmd_status() {
+    local state ip
+    state=$(vm_state)
+    echo "仮想マシン: $VM_NAME（$state）"
+    if [[ $state == "running" ]]; then
+        ip=$(cmd_ip)
+        echo "IP: ${ip:-未取得}"
+    fi
+    if [[ -f $LOCK_FILE ]]; then
+        echo "使用中: $(tr '\n' ' ' < "$LOCK_FILE")"
+    else
+        echo "使用中: なし"
+    fi
+}
+
+# 使用中の印を付ける。複数のプロジェクト（複数のエージェント）が同時に触らないための目印
+cmd_use() {
+    [[ $# -eq 1 ]] || die "使い方: use <プロジェクト名>"
+    if [[ -f $LOCK_FILE ]]; then
+        local holder
+        holder=$(head -1 "$LOCK_FILE")
+        [[ $holder == "$1" ]] \
+            || die "ほかの作業が使用中です: $(tr '\n' ' ' < "$LOCK_FILE")。終わっていることを確かめてから release し、use し直してください"
+    fi
+    printf '%s\n%s\n' "$1" "$(date '+%F %T') から" > "$LOCK_FILE"
+    log "使用中にしました: $1"
+}
+
+cmd_release() {
+    rm -f "$LOCK_FILE"
+    log "使用中の印を外しました"
+}
+
+# 評価版の残り時間を、ライセンスの情報（WMI）から表示する（言語の設定によらず読める）
+cmd_license() {
+    run_ps "$(cat <<'EOF'
+$filter = "PartialProductKey IS NOT NULL AND ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'"
+$p = Get-CimInstance -ClassName SoftwareLicensingProduct -Filter $filter | Select-Object -First 1
+$minutes = [double]$p.GracePeriodRemaining
+$until = (Get-Date).AddMinutes($minutes).ToString('yyyy-MM-dd HH:mm')
+Write-Output ('{0}' -f $p.Name)
+Write-Output ('残り {0} 日（{1} まで）' -f [math]::Floor($minutes / 1440), $until)
+EOF
+)"
+}
+
+cmd_shot() {
+    mkdir -p "$SHOT_DIR"
+    local name=${1:-} base
+    base="$SHOT_DIR/$(date +%Y%m%d-%H%M%S)${name:+-$name}"
+    virsh screenshot "$VM_NAME" "$base.raw" >/dev/null
+    python3 -I "$TOOL_DIR/ppm2png.py" "$base.raw" "$base.png"
+    rm -f "$base.raw"
+    echo "$base.png"
+}
+
+cmd_key() {
+    [[ $# -gt 0 ]] || die "送るキーを指定してください（例: KEY_VOLUMEUP）"
+    virsh send-key "$VM_NAME" --codeset linux "$@" >/dev/null
+}
+
+require_ip() {
+    local ip
+    ip=$(cmd_ip)
+    [[ -n $ip ]] || die "IP アドレスが取れません（起動していないか、まだ DHCP で割り当てられていない）"
+    echo "$ip"
+}
+
+SSH_OPTS=()
+init_ssh_opts() {
+    load_secrets
+    SSH_OPTS=(-i "$SSH_KEY"
+        -o UserKnownHostsFile="$KNOWN_HOSTS"
+        -o StrictHostKeyChecking=accept-new
+        -o ConnectTimeout=5
+        -o BatchMode=yes)
+}
+
+cmd_ssh() {
+    init_ssh_opts
+    local ip
+    ip=$(require_ip)
+    exec ssh "${SSH_OPTS[@]}" "$VM_USER@$ip" "$@"
+}
+
+# PowerShell のスクリプトを Base64（UTF-16LE）にして SSH で実行する。引用符の入れ子を気にしなくてよい
+run_ps() {
+    local script=$1 ip encoded
+    init_ssh_opts
+    ip=$(require_ip)
+    # 日本語の出力が文字化けしないよう、出力を UTF-8 にしてから本体を実行する
+    script="[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(\$false)
+\$ProgressPreference = 'SilentlyContinue'
+$script"
+    encoded=$(printf '%s' "$script" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
+    ssh "${SSH_OPTS[@]}" "$VM_USER@$ip" "powershell.exe -NoProfile -NonInteractive -EncodedCommand $encoded"
+}
+
+cmd_ps() {
+    [[ $# -ge 1 ]] || die "実行するスクリプトを指定してください（- なら標準入力から読む）"
+    local script=$1
+    [[ $script == "-" ]] && script=$(cat)
+    run_ps "$script"
+}
+
+# PowerShell の単一引用符の文字列に埋め込めるよう、' を '' にする
+ps_quote() { local s=${1//\'/\'\'}; printf "'%s'" "$s"; }
+
+# ログオン中のデスクトップでプログラムを起動する。
+# SSH のセッションは画面の無いセッションで動くので、タスク スケジューラーで「ログオン中のユーザー」として起動する
+cmd_run_gui() {
+    local level=Limited hidden=0
+    while [[ ${1:-} == --* ]]; do
+        case $1 in
+            --elevated) level=Highest ;;
+            --hidden) hidden=1 ;;
+            *) die "不明な指定です: $1" ;;
+        esac
+        shift
+    done
+    [[ $# -ge 1 ]] || die "起動するプログラムを指定してください（例: run-gui notepad.exe）"
+    local exe=$1 args="" action
+    shift
+    [[ $# -gt 0 ]] && args="$*"
+    # コンソールのプログラムは Windows Terminal のウィンドウで開き、-WindowStyle Hidden も効かない。
+    # 隠すときは conhost.exe --headless を前に付けて、ウィンドウを作らせない
+    if [[ $hidden -eq 1 ]]; then
+        args="--headless $exe${args:+ $args}"
+        exe="conhost.exe"
+    fi
+    action="New-ScheduledTaskAction -Execute $(ps_quote "$exe")"
+    [[ -n $args ]] && action+=" -Argument $(ps_quote "$args")"
+    run_ps "
+\$ErrorActionPreference = 'Stop'
+\$action = $action
+\$principal = New-ScheduledTaskPrincipal -UserId \$env:USERNAME -LogonType Interactive -RunLevel $level
+\$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+Register-ScheduledTask -TaskName 'win11vm-run-gui' -Action \$action -Principal \$principal -Settings \$settings -Force | Out-Null
+Start-ScheduledTask -TaskName 'win11vm-run-gui'
+Write-Output ('起動しました: ' + $(ps_quote "$exe"))
+"
+}
+
+cmd_push() {
+    [[ $# -ge 2 ]] || die "使い方: push <ローカルのパス>... <ゲストのパス（例: C:/work/myproj）>"
+    local dest=${!#} ip
+    local srcs=("${@:1:$#-1}")
+    run_ps "New-Item -ItemType Directory -Force -Path $(ps_quote "$dest") | Out-Null"
+    ip=$(require_ip)
+    scp -r "${SSH_OPTS[@]}" "${srcs[@]}" "$VM_USER@$ip:$dest/"
+}
+
+cmd_pull() {
+    [[ $# -eq 2 ]] || die "使い方: pull <ゲストのパス> <ローカルのパス>"
+    init_ssh_opts
+    local ip
+    ip=$(require_ip)
+    scp -r "${SSH_OPTS[@]}" "$VM_USER@$ip:$1" "$2"
+}
+
+require_shutoff() {
+    [[ $(vm_state) == "shut off" ]] || die "仮想マシンを止めてから実行してください（stop）。今の状態: $(vm_state)"
+}
+
+# インストールが済んだら ISO は要らないので、CD を取り出してプールから消す。
+# 設定用の ISO はパスワードを含むので、残さない。つないだまま消すと起動できなくなるので、先に取り出す
+eject_install_media() {
+    local target source
+    while read -r target source; do
+        [[ -n $source && $source != "-" ]] || continue
+        log "CD を取り出します: $target（$source）"
+        virsh change-media "$VM_NAME" "$target" --eject --config >/dev/null
+    done < <(virsh domblklist "$VM_NAME" --details | awk '$2 == "cdrom" { print $3, $4 }')
+    local vol
+    for vol in "$VM_NAME-install.iso" "$VM_NAME-unattend.iso"; do
+        if virsh vol-info --pool "$POOL" "$vol" >/dev/null 2>&1; then
+            virsh vol-delete --pool "$POOL" "$vol" >/dev/null
+            log "消しました: $POOL/$vol"
+        fi
+    done
+}
+
+cmd_save_clean() {
+    require_shutoff
+    start_log save-clean
+    eject_install_media
+    if virsh vol-info --pool "$POOL" "$VM_NAME-clean.qcow2" >/dev/null 2>&1; then
+        virsh vol-delete --pool "$POOL" "$VM_NAME-clean.qcow2" >/dev/null
+    fi
+    log "今のディスクを初期状態として複製しています: $POOL/$VM_NAME-clean.qcow2"
+    virsh vol-clone --pool "$POOL" "$VM_NAME.qcow2" "$VM_NAME-clean.qcow2"
+    log "保存しました"
+}
+
+cmd_reset() {
+    require_shutoff
+    virsh vol-info --pool "$POOL" "$VM_NAME-clean.qcow2" >/dev/null 2>&1 \
+        || die "初期状態のディスクがありません（save-clean で作る）"
+    start_log reset
+    log "ディスクを初期状態に戻しています"
+    virsh vol-delete --pool "$POOL" "$VM_NAME.qcow2" >/dev/null
+    virsh vol-clone --pool "$POOL" "$VM_NAME-clean.qcow2" "$VM_NAME.qcow2"
+    log "戻しました"
+}
+
+main() {
+    local sub=${1:-}
+    [[ $# -gt 0 ]] && shift
+    case $sub in
+        download) cmd_download "$@" ;;
+        build-unattend) cmd_build_unattend "$@" ;;
+        create) cmd_create "$@" ;;
+        destroy) cmd_destroy "$@" ;;
+        start) cmd_start "$@" ;;
+        stop) cmd_stop "$@" ;;
+        kill) cmd_kill "$@" ;;
+        status) cmd_status "$@" ;;
+        shot) cmd_shot "$@" ;;
+        key) cmd_key "$@" ;;
+        ip) cmd_ip "$@" ;;
+        ssh) cmd_ssh "$@" ;;
+        ps) cmd_ps "$@" ;;
+        run-gui) cmd_run_gui "$@" ;;
+        push) cmd_push "$@" ;;
+        pull) cmd_pull "$@" ;;
+        save-clean) cmd_save_clean "$@" ;;
+        reset) cmd_reset "$@" ;;
+        use) cmd_use "$@" ;;
+        release) cmd_release "$@" ;;
+        license) cmd_license "$@" ;;
+        -h | --help | help | "") usage ;;
+        *) usage >&2; die "不明なサブコマンドです: $sub" ;;
+    esac
+}
+
+main "$@"
